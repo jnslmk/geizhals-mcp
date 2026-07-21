@@ -1,0 +1,25 @@
+[project]
+name = "geizhals-mcp"
+version = "0.1.0"
+description = "MCP server for Geizhals price-comparison search"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "fastmcp>=3.4.4",
+    # patchright is a patched, undetected Playwright fork — a drop-in for the
+    # playwright async API that stands a chance against Geizhals' Cloudflare.
+    "patchright>=1.49",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+]
+
+[project.scripts]
+geizhals-mcp = "geizhals_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["geizhals_mcp"]
