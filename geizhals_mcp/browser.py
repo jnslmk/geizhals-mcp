@@ -43,6 +43,9 @@ MAX_CONCURRENT = int(os.getenv("GH_MAX_CONCURRENT", "2"))
 # How long to wait for the Cloudflare interstitial to hand off to the real page.
 CHALLENGE_TIMEOUT_MS = int(os.getenv("GH_CHALLENGE_TIMEOUT_MS", "25000"))
 
+# Fresh-context retries when the challenge stalls (probabilistic from a server IP).
+MAX_ATTEMPTS = int(os.getenv("GH_MAX_ATTEMPTS", "3"))
+
 # Headed-under-Xvfb by default (best against Cloudflare). Set GH_HEADLESS=1 for
 # local development on a machine without a display server.
 HEADLESS = os.getenv("GH_HEADLESS", "0") == "1"
@@ -114,14 +117,38 @@ class BrowserManager:
     async def fetch_html(self, url: str) -> str:
         """Load `url`, wait past the Cloudflare interstitial, return page HTML.
 
-        Raises `CloudflareBlocked` if the challenge never clears within the
-        timeout — the caller turns that into a clean tool error rather than a
-        stack trace, since it is the single most likely failure mode here.
+        Cloudflare's managed challenge is probabilistic from a server IP: the
+        same URL may sail through on one attempt and stall on the next. So each
+        fetch gets a couple of tries, each in a *fresh* context (a new browser
+        fingerprint), before giving up.
+
+        Raises `CloudflareBlocked` if every attempt stalls on the interstitial —
+        the caller turns that into a clean tool error rather than a stack trace,
+        since it is the single most likely failure mode here.
         """
+        last_error: CloudflareBlocked | None = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                return await self._fetch_once(url)
+            except CloudflareBlocked as exc:
+                last_error = exc
+                log.warning("Cloudflare stalled on attempt %s/%s for %s", attempt, MAX_ATTEMPTS, url)
+        raise last_error or CloudflareBlocked("Cloudflare challenge did not clear")
+
+    async def _fetch_once(self, url: str) -> str:
         async with self.context() as ctx:
             page = await ctx.new_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
             await self._await_challenge(page)
+            # The product-page JSON-LD (and the offer table) is hydrated by JS
+            # after domcontentloaded, so wait for the network to go idle before
+            # snapshotting. Best-effort: a busy page that never idles still
+            # returns whatever has rendered so far rather than erroring.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1000)
             return await page.content()
 
     async def _await_challenge(self, page: Page) -> None:

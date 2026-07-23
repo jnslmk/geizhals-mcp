@@ -8,12 +8,17 @@ no API keys, no per-query credits.
 Companion to [jnslmk/kleinanzeigen-mcp](https://github.com/jnslmk/kleinanzeigen-mcp)
 — that one covers second-hand classifieds, this one covers new retail goods.
 
-> ⚠️ **Status: scaffolded, not yet smoke-tested.** Geizhals sits behind a
-> Cloudflare JS challenge, so this drives a real (patched, headed) browser to
-> reach the page. The class-name-based selectors in `scraper.py` (`_SEL`) were
-> written without live-HTML access and **must be verified against real pages
-> before the extraction can be trusted**. The JSON-LD and product-href paths are
-> designed to hold regardless. See [Verifying the scraper](#verifying-the-scraper).
+> Geizhals sits behind a Cloudflare JS challenge, so this drives a real
+> (patched, headed) browser to reach the page. Search parsing is anchored on the
+> live `galleryview__*` markup; product detail is read from the page's JSON-LD
+> (`ProductGroup` → variant `AggregateOffer`), which carries the per-merchant
+> offers directly. Both paths were verified end-to-end against live pages
+> (July 2026).
+>
+> **Note on sorting:** the default `relevance` sort returns the products you
+> searched for. `sort=price` asks Geizhals for cheapest-first across its broad
+> free-text match, which for loose queries surfaces cheap loosely-related items —
+> prefer it only with a specific query.
 
 ## Tools
 

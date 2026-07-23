@@ -12,15 +12,19 @@ WORKDIR /app
 # The rest are Chromium's runtime shared-library dependencies (installed via
 # `patchright install --with-deps` below, but the apt lists are needed first).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends xvfb ca-certificates \
+    && apt-get install -y --no-install-recommends xvfb xauth ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install deps before app code so a code change does not redo the ~400 MB
-# Chromium download.
+# Browser first, in a layer that depends on nothing that changes: a ~400 MB
+# Chromium download must not be redone every time this project's own code
+# changes. patchright is pinned loosely here and re-pinned by pyproject below.
+RUN pip install "patchright>=1.49" \
+    && patchright install --with-deps chromium
+
+# App code last so edits only invalidate these two cheap layers.
 COPY pyproject.toml README.md ./
 COPY geizhals_mcp ./geizhals_mcp
-RUN pip install . \
-    && patchright install --with-deps chromium
+RUN pip install .
 
 # Chromium lives in PLAYWRIGHT_BROWSERS_PATH, which root just wrote to; hand it
 # to the unprivileged user the container actually runs as.

@@ -1,22 +1,20 @@
 """Parse Geizhals search and product HTML into plain dicts.
 
 Geizhals has no public API, so this parses rendered HTML fetched by
-`browser.py`. Two things keep it from being brittle:
+`browser.py`. The selectors below were verified against live pages (July 2026):
 
-1. **JSON-LD first.** Geizhals product pages embed a `<script
-   type="application/ld+json">` Product block. Reading price/name/offer-count
-   from that survives CSS-class renames, which are the usual reason a scraper
-   silently breaks.
-2. **Regex on product hrefs.** Every Geizhals product lives at `aNNNNNNN.html`;
-   pulling ids out of the anchors is robust even when the surrounding markup
-   changes. The human-readable fields (name, price) are then read defensively —
-   a missed selector degrades one field to `None`, it does not crash the call.
+* **Search** results render as ``galleryview__*`` tiles — there is no JSON-LD on
+  the SERP — so each product is assembled from the three per-tile anchors
+  (``name-link`` / ``price-link`` / ``offercount-link``) that all share the same
+  ``…-a<id>.html`` href.
+* **Product** pages carry a single ``application/ld+json`` block: a
+  ``ProductGroup`` whose ``hasVariant[]`` entries are ``Product`` objects, each
+  with an ``AggregateOffer`` that nests the individual per-merchant ``Offer``s
+  (seller name, price, click-out url). That structured block is authoritative;
+  the HTML offer table is only a fallback for the rare page without it.
 
-⚠️  SELECTORS ARE UNVERIFIED against live HTML — this repo was scaffolded while
-Geizhals' Cloudflare wall blocked inspection. Everything class-name-based below
-is a best-effort guess collected in `_SEL`; smoke-test each tool and correct
-`_SEL` before trusting a released version. The JSON-LD and href paths are the
-parts meant to hold.
+Product URLs are ``<slug>-a<id>.html``; the bare ``a<id>.html`` form redirects
+to the canonical slug, which is what `get_product` relies on.
 """
 
 from __future__ import annotations
@@ -24,28 +22,23 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
-from urllib.parse import quote_plus, urljoin
-
-from bs4 import BeautifulSoup, Tag
+from urllib.parse import quote_plus
 
 BASE_URL = "https://geizhals.de/"
 
-# Product id -> canonical URL. `aNNNNNNN.html` is Geizhals' permanent product URL
-# shape and the one stable anchor in the whole page.
-_PRODUCT_HREF = re.compile(r"/a(\d+)\.html")
+# Product id from a Geizhals URL: canonical is "<slug>-a<id>.html"; the bare
+# "/a<id>.html" redirect form is matched too.
+_PRODUCT_HREF = re.compile(r"[/-]a(\d+)\.html")
+# German price: "€ 1.299,00" / "749,00" -> 1299.00 / 749.00
 _PRICE = re.compile(r"(\d[\d.\s]*),(\d{2})")
 
-# All fragile, class-name-based selectors live here so a markup change is a
-# one-place fix. Each is a CSS selector tried in order; first hit wins.
-_SEL: dict[str, tuple[str, ...]] = {
-    "row": ("div.productlist__item", "div.cat__product", "article"),
-    "row_price": (".productlist__price", ".gh_price", "[class*='price']"),
-    "row_offercount": (".productlist__offercount", "[class*='offercount']"),
-    "product_title": ("h1.variant__header__headline", "h1"),
-    "offer_row": ("div.offerlist__row", ".offer__row", "tr.row"),
-    "offer_merchant": (".offer__merchant-name", ".merchant", "[class*='merchant']"),
-    "offer_price": (".offer__price", ".gh_price", "[class*='price']"),
-    "offer_availability": (".offer__delivery", ".availability", "[class*='delivery']"),
+# The few HTML selectors still used, kept in one place. The product-page parser
+# is JSON-LD-first, so these only back the search SERP and a title fallback.
+_SEL: dict[str, str] = {
+    "name_link": "a.galleryview__name-link",
+    "price_link": "a.galleryview__price-link",
+    "offercount_link": "a.galleryview__offercount-link",
+    "product_title": "h1",
 }
 
 
@@ -58,16 +51,7 @@ def search_url(query: str, *, sort: str | None = None, region: str = "de") -> st
     return url
 
 
-def _first(node: Tag, keys: tuple[str, ...]) -> Tag | None:
-    for sel in keys:
-        found = node.select_one(sel)
-        if found is not None:
-            return found
-    return None
-
-
 def _to_eur(text: str | None) -> float | None:
-    """Parse a German-formatted price ('1.299,00 €') into a float."""
     if not text:
         return None
     m = _PRICE.search(text)
@@ -77,7 +61,158 @@ def _to_eur(text: str | None) -> float | None:
     return float(f"{whole}.{m.group(2)}")
 
 
-def _jsonld_blocks(soup: BeautifulSoup) -> list[dict[str, Any]]:
+def _int_of(text: str | None) -> int | None:
+    if not text:
+        return None
+    m = re.search(r"\d+", text)
+    return int(m.group()) if m else None
+
+
+def _url_id(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = _PRODUCT_HREF.search(url)
+    return m.group(1) if m else None
+
+
+# --------------------------------------------------------------------------- #
+# search
+# --------------------------------------------------------------------------- #
+
+# Import here so a bs4-less environment still imports the pure helpers above.
+from bs4 import BeautifulSoup, Tag  # noqa: E402
+
+
+def parse_search(html: str, *, max_results: int) -> list[dict[str, Any]]:
+    """Extract product summaries from a search results page.
+
+    Each Geizhals tile exposes its product through several anchors that share
+    one ``…-a<id>.html`` href; we group them by that id so name, price and offer
+    count land on one record. Order follows the page's own ranking.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    products: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    selector = ", ".join(
+        (_SEL["name_link"], _SEL["price_link"], _SEL["offercount_link"])
+    )
+    for a in soup.select(selector):
+        pid = _url_id(a.get("href", ""))
+        if not pid:
+            continue
+        rec = products.get(pid)
+        if rec is None:
+            rec = {
+                "id": pid,
+                "name": None,
+                "price": None,
+                "currency": "EUR",
+                "offer_count": None,
+                "url": f"{BASE_URL}a{pid}.html",
+            }
+            products[pid] = rec
+            order.append(pid)
+
+        classes = a.get("class") or []
+        text = a.get_text(" ", strip=True)
+        if "galleryview__name-link" in classes:
+            rec["name"] = text or rec["name"]
+            rec["url"] = (a.get("href") or rec["url"]).split("#")[0]
+        elif "galleryview__price-link" in classes:
+            rec["price"] = _to_eur(text)
+        elif "galleryview__offercount-link" in classes:
+            rec["offer_count"] = _int_of(text)
+
+    results = [products[i] for i in order if products[i]["name"]]
+    return results[:max_results]
+
+
+# --------------------------------------------------------------------------- #
+# product detail
+# --------------------------------------------------------------------------- #
+
+
+def parse_product(html: str, product_id: str) -> dict[str, Any]:
+    """Extract a product's name, price range and per-merchant offers.
+
+    Reads the page's JSON-LD ``ProductGroup``, picking the ``hasVariant`` entry
+    matching ``product_id`` (the page shows the whole group even when a single
+    variant was requested). Falls back to the ``<h1>`` and an empty offer list
+    if the structured data is missing.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    product = _find_product_ld(soup, product_id)
+
+    if product is None:
+        title = soup.select_one(_SEL["product_title"])
+        return {
+            "id": product_id,
+            "name": title.get_text(" ", strip=True) if title else None,
+            "url": f"{BASE_URL}a{product_id}.html",
+            "price_min": None,
+            "price_max": None,
+            "currency": "EUR",
+            "offer_count": None,
+            "offers": [],
+        }
+
+    agg = product.get("offers") or {}
+    if isinstance(agg, list):
+        agg = agg[0] if agg else {}
+    offers = _sellers(agg)
+
+    return {
+        "id": product_id,
+        "name": product.get("name"),
+        "url": product.get("url") or f"{BASE_URL}a{product_id}.html",
+        "price_min": _num(agg.get("lowPrice")),
+        "price_max": _num(agg.get("highPrice")),
+        "currency": agg.get("priceCurrency", "EUR"),
+        "offer_count": _num(agg.get("offerCount")) or (len(offers) or None),
+        "offers": offers,
+    }
+
+
+def _find_product_ld(soup: "BeautifulSoup", pid: str) -> dict[str, Any] | None:
+    """Find the JSON-LD Product for `pid` — direct, or a ProductGroup variant."""
+    blocks = _jsonld_blocks(soup)
+    for block in blocks:
+        if block.get("@type") == "Product" and _url_id(block.get("url")) in (pid, None):
+            return block
+    for block in blocks:
+        if block.get("@type") == "ProductGroup":
+            for variant in block.get("hasVariant") or []:
+                if _url_id(variant.get("url")) == pid:
+                    return variant
+    # Last resort: any Product-shaped block on the page.
+    for block in blocks:
+        if block.get("@type") == "Product":
+            return block
+    return None
+
+
+def _sellers(aggregate: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-merchant offers from an AggregateOffer's nested `offers` list."""
+    out: list[dict[str, Any]] = []
+    for offer in aggregate.get("offers") or []:
+        if not isinstance(offer, dict):
+            continue
+        seller = offer.get("seller") or {}
+        out.append(
+            {
+                "merchant": seller.get("name") if isinstance(seller, dict) else None,
+                "price": _num(offer.get("price")),
+                "currency": offer.get("priceCurrency", "EUR"),
+                "url": offer.get("url"),
+                "availability": _short_avail(offer.get("availability")),
+            }
+        )
+    out.sort(key=lambda o: (o["price"] is None, o["price"]))
+    return out
+
+
+def _jsonld_blocks(soup: "BeautifulSoup") -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
@@ -88,182 +223,15 @@ def _jsonld_blocks(soup: BeautifulSoup) -> list[dict[str, Any]]:
     return blocks
 
 
-def _product_jsonld(soup: BeautifulSoup) -> dict[str, Any] | None:
-    for block in _jsonld_blocks(soup):
-        if block.get("@type") == "Product":
-            return block
-    return None
-
-
-# --------------------------------------------------------------------------- #
-# search
-# --------------------------------------------------------------------------- #
-
-
-def parse_search(html: str, *, max_results: int) -> list[dict[str, Any]]:
-    """Extract product summaries from a search results page.
-
-    Anchored on the `aNNNNNNN.html` hrefs (stable); name and price are read from
-    the surrounding row defensively. Deduplicated by product id, preserving the
-    page's own ranking order.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    results: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    for anchor in soup.find_all("a", href=_PRODUCT_HREF):
-        m = _PRODUCT_HREF.search(anchor.get("href", ""))
-        if not m:
-            continue
-        pid = m.group(1)
-        if pid in seen:
-            continue
-
-        name = (anchor.get("title") or anchor.get_text(strip=True) or "").strip()
-        if not name:
-            continue  # image-only or utility anchors to the same product
-        seen.add(pid)
-
-        row = _enclosing_row(anchor)
-        price = None
-        offers = None
-        if row is not None:
-            price = _to_eur(_text_of(_first(row, _SEL["row_price"])))
-            offers = _int_of(_text_of(_first(row, _SEL["row_offercount"])))
-
-        results.append(
-            {
-                "id": pid,
-                "name": name,
-                "price": price,
-                "currency": "EUR",
-                "offer_count": offers,
-                "url": urljoin(BASE_URL, f"a{pid}.html"),
-            }
-        )
-        if len(results) >= max_results:
-            break
-
-    return results
-
-
-def _enclosing_row(anchor: Tag) -> Tag | None:
-    """Walk up to the product row so we can read its price/offer-count."""
-    for sel in _SEL["row"]:
-        row = anchor.find_parent(_row_matcher(sel))
-        if row is not None:
-            return row
-    return anchor.parent
-
-
-def _row_matcher(sel: str):
-    # find_parent needs a predicate; translate the simple "tag.class" selectors
-    # in _SEL into one. Anything fancier falls back to a tag-name match.
-    if "." in sel:
-        tag, _, cls = sel.partition(".")
-        return lambda t: t.name == (tag or t.name) and cls in (t.get("class") or [])
-    return sel
-
-
-# --------------------------------------------------------------------------- #
-# product detail
-# --------------------------------------------------------------------------- #
-
-
-def parse_product(html: str, product_id: str) -> dict[str, Any]:
-    """Extract a product's name, aggregate price and per-merchant offers."""
-    soup = BeautifulSoup(html, "lxml")
-    ld = _product_jsonld(soup) or {}
-
-    name = ld.get("name") or _text_of(_first(soup, _SEL["product_title"]))
-    aggregate = _aggregate_from_ld(ld)
-    offers = _parse_offers(soup)
-
-    return {
-        "id": product_id,
-        "name": name,
-        "url": urljoin(BASE_URL, f"a{product_id}.html"),
-        "price_min": aggregate.get("low"),
-        "price_max": aggregate.get("high"),
-        "currency": aggregate.get("currency", "EUR"),
-        "offer_count": aggregate.get("count", len(offers) or None),
-        "offers": offers,
-    }
-
-
-def _aggregate_from_ld(ld: dict[str, Any]) -> dict[str, Any]:
-    offers = ld.get("offers") or {}
-    if isinstance(offers, list):  # some pages emit a list of Offer, not Aggregate
-        prices = [
-            float(o["price"])
-            for o in offers
-            if isinstance(o, dict) and _is_number(o.get("price"))
-        ]
-        return {
-            "low": min(prices) if prices else None,
-            "high": max(prices) if prices else None,
-            "count": len(offers) or None,
-            "currency": _first_currency(offers),
-        }
-    return {
-        "low": _num(offers.get("lowPrice")),
-        "high": _num(offers.get("highPrice")),
-        "count": _num(offers.get("offerCount")),
-        "currency": offers.get("priceCurrency", "EUR"),
-    }
-
-
-def _parse_offers(soup: BeautifulSoup) -> list[dict[str, Any]]:
-    """Per-merchant offers from the offer list. Best-effort, per-row isolated."""
-    offers: list[dict[str, Any]] = []
-    for sel in _SEL["offer_row"]:
-        rows = soup.select(sel)
-        if rows:
-            for row in rows:
-                offer = {
-                    "merchant": _text_of(_first(row, _SEL["offer_merchant"])),
-                    "price": _to_eur(_text_of(_first(row, _SEL["offer_price"]))),
-                    "availability": _text_of(_first(row, _SEL["offer_availability"])),
-                }
-                if offer["merchant"] or offer["price"] is not None:
-                    offers.append(offer)
-            break  # first selector that matched rows wins
-    return offers
-
-
-# --------------------------------------------------------------------------- #
-# tiny helpers
-# --------------------------------------------------------------------------- #
-
-
-def _text_of(node: Tag | None) -> str | None:
-    if node is None:
+def _short_avail(value: Any) -> str | None:
+    """'https://schema.org/InStock' -> 'InStock'."""
+    if not isinstance(value, str):
         return None
-    text = node.get_text(" ", strip=True)
-    return text or None
-
-
-def _int_of(text: str | None) -> int | None:
-    if not text:
-        return None
-    m = re.search(r"\d+", text)
-    return int(m.group()) if m else None
+    return value.rsplit("/", 1)[-1] or None
 
 
 def _num(value: Any) -> float | None:
-    return float(value) if _is_number(value) else None
-
-
-def _is_number(value: Any) -> bool:
     try:
-        float(value)
+        return float(value)
     except (TypeError, ValueError):
-        return False
-    return True
-
-
-def _first_currency(offers: list[Any]) -> str:
-    for o in offers:
-        if isinstance(o, dict) and o.get("priceCurrency"):
-            return o["priceCurrency"]
-    return "EUR"
+        return None
