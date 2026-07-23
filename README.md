@@ -69,6 +69,8 @@ container healthchecks. Give the container at least 1.5 GB of memory and
 | `GH_MAX_BATCH_SIZE` | `10` | Cap on ids per `get_products_batch` call |
 | `GH_CHALLENGE_TIMEOUT_MS` | `25000` | How long to wait for Cloudflare to clear |
 | `GH_HEADLESS` | `0` | `1` runs headless (local dev without a display) |
+| `GH_PROXY` | *(none)* | Egress proxy URL, e.g. `http://10.0.0.5:8888` — see below |
+| `GH_PROXY_USERNAME` / `GH_PROXY_PASSWORD` | *(none)* | Optional proxy auth |
 | `LOG_LEVEL` | `INFO` | Python log level |
 
 ### LibreChat
@@ -121,10 +123,19 @@ The extraction was written without live-HTML access. Before trusting a release:
 
 ## Cloudflare and proxies
 
-Cloudflare challenges are much harsher on datacenter IPs. If the headed-Xvfb
-browser cannot clear them from your host, point Chromium at a residential/mobile
-egress proxy. `browser.py` is the single place to add a `proxy=` argument to
-`chromium.launch`.
+Cloudflare challenges are much harsher on datacenter IPs — in practice it will
+**not** clear from a typical VPS. Route the browser through a residential IP by
+setting `GH_PROXY` to an HTTP proxy that egresses from one (for a self-hosted
+setup, a small proxy on a home box reachable over a VPN/tailnet works well):
+
+```bash
+docker run --rm -p 8000:8000 --shm-size=1g \
+  -e GH_PROXY=http://192.168.1.10:8888 \
+  ghcr.io/jnslmk/geizhals-mcp:latest
+```
+
+`browser.py` passes it straight to `chromium.launch(proxy=…)`. From a residential
+IP no proxy is needed.
 
 ## Images
 

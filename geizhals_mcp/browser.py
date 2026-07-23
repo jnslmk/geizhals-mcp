@@ -50,6 +50,25 @@ MAX_ATTEMPTS = int(os.getenv("GH_MAX_ATTEMPTS", "3"))
 # local development on a machine without a display server.
 HEADLESS = os.getenv("GH_HEADLESS", "0") == "1"
 
+# Optional egress proxy. Cloudflare hard-blocks datacenter IPs, so a deployment
+# on a server routes the browser through a residential IP (e.g. an HTTP proxy on
+# a home box reachable over the tailnet). GH_PROXY is a full proxy URL such as
+# "http://100.112.187.107:8888"; auth is optional via GH_PROXY_USERNAME/PASSWORD.
+PROXY_SERVER = os.getenv("GH_PROXY") or None
+PROXY_USERNAME = os.getenv("GH_PROXY_USERNAME") or None
+PROXY_PASSWORD = os.getenv("GH_PROXY_PASSWORD") or None
+
+
+def _proxy_config() -> dict[str, str] | None:
+    if not PROXY_SERVER:
+        return None
+    proxy: dict[str, str] = {"server": PROXY_SERVER}
+    if PROXY_USERNAME:
+        proxy["username"] = PROXY_USERNAME
+    if PROXY_PASSWORD:
+        proxy["password"] = PROXY_PASSWORD
+    return proxy
+
 # Markers that mean "still on the Cloudflare interstitial, not the real page".
 _CHALLENGE_MARKERS = (
     "just a moment",
@@ -70,8 +89,10 @@ class BrowserManager:
 
     async def start(self) -> None:
         self._playwright = await async_playwright().start()
+        proxy = _proxy_config()
         self._browser = await self._playwright.chromium.launch(
             headless=HEADLESS,
+            proxy=proxy,
             args=[
                 # Required in a container: Chromium's own sandbox needs either
                 # privileged caps or user namespaces we do not grant.
@@ -80,7 +101,12 @@ class BrowserManager:
                 "--disable-blink-features=AutomationControlled",
             ],
         )
-        log.info("Chromium ready (headless=%s, max_concurrent=%s)", HEADLESS, MAX_CONCURRENT)
+        log.info(
+            "Chromium ready (headless=%s, max_concurrent=%s, proxy=%s)",
+            HEADLESS,
+            MAX_CONCURRENT,
+            PROXY_SERVER or "none",
+        )
 
     async def close(self) -> None:
         if self._browser is not None:
