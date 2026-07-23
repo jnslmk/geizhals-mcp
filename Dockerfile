@@ -24,7 +24,9 @@ RUN pip install "patchright>=1.49" \
 # App code last so edits only invalidate these two cheap layers.
 COPY pyproject.toml README.md ./
 COPY geizhals_mcp ./geizhals_mcp
-RUN pip install .
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN pip install . \
+    && chmod 0755 /usr/local/bin/entrypoint.sh
 
 # Chromium lives in PLAYWRIGHT_BROWSERS_PATH, which root just wrote to; hand it
 # to the unprivileged user the container actually runs as.
@@ -37,5 +39,6 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5).status == 200 else 1)"
 
-# xvfb-run gives Chromium a virtual display so it can launch headed.
-CMD ["xvfb-run", "-a", "--server-args=-screen 0 1366x900x24", "geizhals-mcp"]
+# entrypoint.sh starts Xvfb deterministically (no xvfb-run signal race) and
+# then execs the server as PID 1.
+CMD ["/usr/local/bin/entrypoint.sh"]
