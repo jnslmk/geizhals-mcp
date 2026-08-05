@@ -44,6 +44,31 @@ def _manager() -> BrowserManager:
     return _browser
 
 
+def _coerce_int(
+    value: str | int | None, field: str, *, ge: int | None = None
+) -> int | None:
+    """Coerce the numeric strings LLMs routinely send for int parameters.
+
+    FastMCP validates tool input against the JSON schema before the function
+    runs, so a parameter typed ``int`` rejects the string ``"600"`` outright
+    (the same bug kleinanzeigen-mcp 0.1.1 fixed for its price params).
+    Accepting ``str | int`` in the schema and normalising here keeps the
+    model-facing contract lenient while the scraper still sees a real int.
+    """
+    if value is None or isinstance(value, int):
+        result = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            result = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an integer, got {value!r}") from exc
+    else:
+        raise ValueError(f"{field} must be an integer, got {value!r}")
+    if ge is not None and result is not None and result < ge:
+        raise ValueError(f"{field} must be >= {ge}, got {result}")
+    return result
+
+
 @asynccontextmanager
 async def lifespan(_: FastMCP) -> AsyncIterator[None]:
     """Start one shared browser for the process lifetime."""
@@ -59,7 +84,7 @@ async def lifespan(_: FastMCP) -> AsyncIterator[None]:
 
 mcp = FastMCP(
     name="geizhals",
-    version="0.1.2",
+    version="0.1.3",
     lifespan=lifespan,
     instructions=(
         "Search Geizhals, a leading German/DACH price-comparison site, for the "
@@ -83,10 +108,14 @@ async def search_products(
         str,
         Field(description="'price' for cheapest first, or 'relevance' (default)"),
     ] = "relevance",
-    min_price: Annotated[int | None, Field(description="Minimum price in EUR", ge=0)] = None,
-    max_price: Annotated[int | None, Field(description="Maximum price in EUR", ge=0)] = None,
+    min_price: Annotated[
+        str | int | None, Field(description="Minimum price in EUR")
+    ] = None,
+    max_price: Annotated[
+        str | int | None, Field(description="Maximum price in EUR")
+    ] = None,
     max_results: Annotated[
-        int, Field(description="Maximum product summaries to return", ge=1)
+        str | int, Field(description="Maximum product summaries to return")
     ] = 20,
 ) -> dict[str, Any]:
     """Search Geizhals for products matching a keyword.
@@ -98,9 +127,14 @@ async def search_products(
     """
     sort_code = {"price": "p", "relevance": "r"}.get(sort, "r")
     url = scraper.search_url(query, sort=sort_code)
+
+    min_price = _coerce_int(min_price, "min_price", ge=0)
+    max_price = _coerce_int(max_price, "max_price", ge=0)
+    max_results = min(_coerce_int(max_results, "max_results", ge=1) or 20, MAX_RESULTS)
+
     html = await _fetch(url)
 
-    results = scraper.parse_search(html, max_results=min(max_results, MAX_RESULTS))
+    results = scraper.parse_search(html, max_results=max_results)
     if min_price is not None:
         results = [r for r in results if r["price"] is None or r["price"] >= min_price]
     if max_price is not None:
@@ -136,14 +170,15 @@ async def get_products_batch(
         Field(description="Product ids to fetch, typically taken from a search"),
     ],
     max_concurrent: Annotated[
-        int, Field(description="Detail pages to fetch in parallel", ge=1, le=3)
+        str | int, Field(description="Detail pages to fetch in parallel")
     ] = 2,
 ) -> dict[str, Any]:
     """Fetch full offer lists for several products in one call.
 
     The normal follow-up to `search_products`. Failed ids are reported in
-    `errors` rather than failing the whole call. Keep `max_concurrent` low —
-    Geizhals is behind Cloudflare and throttles aggressive parallel access.
+    `errors` rather than failing the whole call. The browser-level
+    `GH_MAX_CONCURRENT` gate caps concurrent tool calls; `max_concurrent` only
+    limits the detail fetches inside this call.
     """
     ids = [i.strip() for i in product_ids if i and i.strip().isdigit()]
     if not ids:
@@ -152,6 +187,7 @@ async def get_products_batch(
         raise ValueError(
             f"Too many ids ({len(ids)}); fetch at most {MAX_BATCH_SIZE} per call"
         )
+    max_concurrent = min(_coerce_int(max_concurrent, "max_concurrent", ge=1) or 2, 3)
 
     semaphore = asyncio.Semaphore(max_concurrent)
 
@@ -183,7 +219,7 @@ async def get_products_batch(
 async def search_by_url(
     url: Annotated[str, Field(description="A geizhals.de/.at/.eu search or category URL")],
     max_results: Annotated[
-        int, Field(description="Maximum product summaries to return", ge=1)
+        str | int, Field(description="Maximum product summaries to return")
     ] = 20,
 ) -> dict[str, Any]:
     """Search using a Geizhals URL, preserving all of its filters.
@@ -194,8 +230,9 @@ async def search_by_url(
     """
     if "geizhals." not in url:
         raise ValueError("url must be a geizhals.de/.at/.eu URL")
+    max_results = min(_coerce_int(max_results, "max_results", ge=1) or 20, MAX_RESULTS)
     html = await _fetch(url)
-    results = scraper.parse_search(html, max_results=min(max_results, MAX_RESULTS))
+    results = scraper.parse_search(html, max_results=max_results)
     return {"url": url, "returned": len(results), "results": results}
 
 
