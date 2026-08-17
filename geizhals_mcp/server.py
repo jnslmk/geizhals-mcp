@@ -69,6 +69,56 @@ def _coerce_int(
     return result
 
 
+def _resolve_max_results(
+    max_results: str | int | None, limit: str | int | None
+) -> int:
+    """Accept either name for the result-cap knob, on both search tools.
+
+    Across the sibling product-search MCP servers this knob has two names —
+    ``max_results`` here and in baumarkt-mcp, ``limit`` in aliexpress-mcp,
+    ebay-mcp and amazon-mcp — and one LLM sees all of them in a single
+    conversation. FastMCP emits ``additionalProperties: false``, so a model
+    that carried ``limit`` over from a sibling server got a hard schema
+    rejection, and LibreChat's rejection message names no field ("Additional
+    properties are not allowed"), so the model cannot see what to fix and can
+    only guess (mirrors the ``page_count``/``max_pages`` split kleinanzeigen-mcp
+    hit for the same reason).
+
+    ``max_results`` stays canonical rather than being renamed, to avoid churn
+    for existing callers; ``limit`` is accepted as a declared, deprecated
+    alias rather than silently swallowed — an unknown key that is quietly
+    ignored would hand back the default 20 results while the model believed
+    it had asked for more.
+    """
+    if max_results is not None and limit is not None:
+        resolved = _coerce_int(max_results, "max_results", ge=1)
+        alias = _coerce_int(limit, "limit", ge=1)
+        if resolved != alias:
+            raise ValueError(
+                "max_results and limit are two names for the same parameter "
+                f"but were given different values ({resolved} and {alias}); "
+                "pass max_results only"
+            )
+    elif limit is not None:
+        resolved = _coerce_int(limit, "limit", ge=1)
+    else:
+        resolved = _coerce_int(max_results, "max_results", ge=1)
+    return min(resolved or 20, MAX_RESULTS)
+
+
+# Shared by both search tools so the pair can never drift apart again. The
+# alias is declared in the schema rather than silently swallowed, for the
+# same reason as `_resolve_max_results` above.
+_MaxResults = Annotated[
+    str | int | None,
+    Field(description="Maximum product summaries to return (default 20)"),
+]
+_LimitAlias = Annotated[
+    str | int | None,
+    Field(description="Deprecated alias for `max_results`; prefer `max_results`"),
+]
+
+
 @asynccontextmanager
 async def lifespan(_: FastMCP) -> AsyncIterator[None]:
     """Start one shared browser for the process lifetime."""
@@ -84,7 +134,7 @@ async def lifespan(_: FastMCP) -> AsyncIterator[None]:
 
 mcp = FastMCP(
     name="geizhals",
-    version="0.1.3",
+    version="0.1.4",
     lifespan=lifespan,
     instructions=(
         "Search Geizhals, a leading German/DACH price-comparison site, for the "
@@ -114,9 +164,8 @@ async def search_products(
     max_price: Annotated[
         str | int | None, Field(description="Maximum price in EUR")
     ] = None,
-    max_results: Annotated[
-        str | int, Field(description="Maximum product summaries to return")
-    ] = 20,
+    max_results: _MaxResults = None,
+    limit: _LimitAlias = None,
 ) -> dict[str, Any]:
     """Search Geizhals for products matching a keyword.
 
@@ -130,7 +179,7 @@ async def search_products(
 
     min_price = _coerce_int(min_price, "min_price", ge=0)
     max_price = _coerce_int(max_price, "max_price", ge=0)
-    max_results = min(_coerce_int(max_results, "max_results", ge=1) or 20, MAX_RESULTS)
+    max_results = _resolve_max_results(max_results, limit)
 
     html = await _fetch(url)
 
@@ -218,9 +267,8 @@ async def get_products_batch(
 @mcp.tool
 async def search_by_url(
     url: Annotated[str, Field(description="A geizhals.de/.at/.eu search or category URL")],
-    max_results: Annotated[
-        str | int, Field(description="Maximum product summaries to return")
-    ] = 20,
+    max_results: _MaxResults = None,
+    limit: _LimitAlias = None,
 ) -> dict[str, Any]:
     """Search using a Geizhals URL, preserving all of its filters.
 
@@ -230,7 +278,7 @@ async def search_by_url(
     """
     if "geizhals." not in url:
         raise ValueError("url must be a geizhals.de/.at/.eu URL")
-    max_results = min(_coerce_int(max_results, "max_results", ge=1) or 20, MAX_RESULTS)
+    max_results = _resolve_max_results(max_results, limit)
     html = await _fetch(url)
     results = scraper.parse_search(html, max_results=max_results)
     return {"url": url, "returned": len(results), "results": results}
