@@ -8,7 +8,8 @@
       "extra-files": [
         "geizhals_mcp/server.py"
       ],
-      "last-release-sha": "7f09c896fb56bd394aa35939ed4bc730bd07ea13"
+      "last-release-sha": "7f09c896fb56bd394aa35939ed4bc730bd07ea13",
+      "include-component-in-tag": false
     }
   }
 }
