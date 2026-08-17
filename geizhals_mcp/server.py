@@ -134,7 +134,7 @@ async def lifespan(_: FastMCP) -> AsyncIterator[None]:
 
 mcp = FastMCP(
     name="geizhals",
-    version="0.1.4",  # x-release-please-version
+    version="0.2.0",  # x-release-please-version
     lifespan=lifespan,
     instructions=(
         "Search Geizhals, a leading German/DACH price-comparison site, for the "
