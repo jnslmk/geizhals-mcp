@@ -1,0 +1,30 @@
+# Automated semver releases from Conventional Commits.
+#
+# release-please reads the commits since the last release, works out the next
+# version (fix -> patch, feat -> minor, ! / BREAKING CHANGE -> major) and opens
+# a release PR that bumps every version location and writes the CHANGELOG.
+# Merging that PR creates the `v<version>` tag and the GitHub Release — which is
+# what build.yml already triggers on, so the image publishes itself from there.
+#
+# The version therefore has exactly one author (this workflow) and one source of
+# truth (pyproject.toml). Before this, the literal lived in two or three files
+# per repo and drifted in four of the six servers.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
