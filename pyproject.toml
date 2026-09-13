@@ -1,6 +1,6 @@
 [project]
 name = "geizhals-mcp"
-version = "0.1.4"
+version = "0.1.5"
 description = "MCP server for Geizhals price-comparison search"
 readme = "README.md"
 requires-python = ">=3.12"
