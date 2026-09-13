@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -34,17 +35,27 @@ from patchright.async_api import (
 
 log = logging.getLogger("geizhals-mcp.browser")
 
-# Concurrency is deliberately tiny: each context is a real browser profile, and
-# hammering Cloudflare in parallel from one datacenter IP is the fastest way to
-# get the whole IP challenged or blocked. A chat agent issues one request at a
-# time anyway.
-MAX_CONCURRENT = int(os.getenv("GH_MAX_CONCURRENT", "2"))
+# Keep direct scraping deliberately gentle. The upper bound prevents an
+# environment mistake from turning one MCP call into a request burst.
+MAX_CONCURRENT = max(1, min(int(os.getenv("GH_MAX_CONCURRENT", "1")), 2))
+
+# Minimum delay between browser navigations, shared by all tool calls.
+MIN_REQUEST_INTERVAL_SECONDS = max(
+    0.0, float(os.getenv("GH_MIN_REQUEST_INTERVAL_SECONDS", "2"))
+)
+
+# Once all attempts hit the challenge, fail subsequent calls fast until this
+# window expires instead of repeatedly spending challenge timeouts.
+CLOUDFLARE_COOLDOWN_SECONDS = max(
+    0.0, float(os.getenv("GH_CLOUDFLARE_COOLDOWN_SECONDS", "60"))
+)
+
+# Keep retries finite and conservative. The cap is intentional even when an
+# operator supplies an unexpectedly large environment value.
+MAX_ATTEMPTS = min(max(int(os.getenv("GH_MAX_ATTEMPTS", "2")), 1), 3)
 
 # How long to wait for the Cloudflare interstitial to hand off to the real page.
 CHALLENGE_TIMEOUT_MS = int(os.getenv("GH_CHALLENGE_TIMEOUT_MS", "25000"))
-
-# Fresh-context retries when the challenge stalls (probabilistic from a server IP).
-MAX_ATTEMPTS = int(os.getenv("GH_MAX_ATTEMPTS", "3"))
 
 # Headed-under-Xvfb by default (best against Cloudflare). Set GH_HEADLESS=1 for
 # local development on a machine without a display server.
@@ -69,6 +80,7 @@ def _proxy_config() -> dict[str, str] | None:
         proxy["password"] = PROXY_PASSWORD
     return proxy
 
+
 # Markers that mean "still on the Cloudflare interstitial, not the real page".
 _CHALLENGE_MARKERS = (
     "just a moment",
@@ -79,6 +91,14 @@ _CHALLENGE_MARKERS = (
 )
 
 
+class CloudflareBlocked(RuntimeError):
+    """Raised when Cloudflare blocks a request or the cooldown is active."""
+
+    def __init__(self, message: str, *, retry_after: float = 0.0) -> None:
+        super().__init__(message)
+        self.retry_after = max(0.0, retry_after)
+
+
 class BrowserManager:
     """Owns one Chromium instance and vends short-lived contexts."""
 
@@ -86,6 +106,9 @@ class BrowserManager:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._request_gate = asyncio.Lock()
+        self._next_request_at = 0.0
+        self._cooldown_until = 0.0
 
     async def start(self) -> None:
         self._playwright = await async_playwright().start()
@@ -141,25 +164,58 @@ class BrowserManager:
                 await ctx.close()
 
     async def fetch_html(self, url: str) -> str:
-        """Load `url`, wait past the Cloudflare interstitial, return page HTML.
+        """Load `url`, returning bounded, explicit Cloudflare failures.
 
-        Cloudflare's managed challenge is probabilistic from a server IP: the
-        same URL may sail through on one attempt and stall on the next. So each
-        fetch gets a couple of tries, each in a *fresh* context (a new browser
-        fingerprint), before giving up.
-
-        Raises `CloudflareBlocked` if every attempt stalls on the interstitial —
-        the caller turns that into a clean tool error rather than a stack trace,
-        since it is the single most likely failure mode here.
+        Navigations are globally paced even when several MCP calls arrive at
+        once. Challenge failures get at most ``MAX_ATTEMPTS`` fresh contexts;
+        exhausting them starts a shared cooldown so follow-up calls fail fast.
         """
         last_error: CloudflareBlocked | None = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            await self._wait_for_request_slot()
             try:
                 return await self._fetch_once(url)
             except CloudflareBlocked as exc:
                 last_error = exc
-                log.warning("Cloudflare stalled on attempt %s/%s for %s", attempt, MAX_ATTEMPTS, url)
-        raise last_error or CloudflareBlocked("Cloudflare challenge did not clear")
+                log.warning(
+                    "Cloudflare stalled on attempt %s/%s for %s",
+                    attempt,
+                    MAX_ATTEMPTS,
+                    url,
+                )
+        retry_after = await self._start_cooldown()
+        message = (
+            f"Cloudflare challenge did not clear after {MAX_ATTEMPTS} "
+            "attempts; requests are paused"
+        )
+        if retry_after:
+            message += f" — retry in about {retry_after:.0f}s"
+        raise CloudflareBlocked(message, retry_after=retry_after) from last_error
+
+    async def _wait_for_request_slot(self) -> None:
+        """Wait for pacing, or reject immediately during a shared cooldown."""
+        async with self._request_gate:
+            now = time.monotonic()
+            if self._cooldown_until > now:
+                retry_after = self._cooldown_until - now
+                raise CloudflareBlocked(
+                    "Cloudflare cooldown is active; retry in "
+                    f"about {retry_after:.0f}s",
+                    retry_after=retry_after,
+                )
+            wait = self._next_request_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = time.monotonic()
+            self._next_request_at = now + MIN_REQUEST_INTERVAL_SECONDS
+
+    async def _start_cooldown(self) -> float:
+        async with self._request_gate:
+            self._cooldown_until = max(
+                self._cooldown_until,
+                time.monotonic() + CLOUDFLARE_COOLDOWN_SECONDS,
+            )
+            return max(0.0, self._cooldown_until - time.monotonic())
 
     async def _fetch_once(self, url: str) -> str:
         async with self.context() as ctx:
@@ -189,11 +245,5 @@ class BrowserManager:
                 return
             await page.wait_for_timeout(step)
             waited += step
-        raise CloudflareBlocked(
-            "Cloudflare challenge did not clear in time — the datacenter IP is "
-            "likely flagged. A residential/mobile egress proxy is usually the fix."
-        )
+        raise CloudflareBlocked("Cloudflare challenge did not clear in time")
 
-
-class CloudflareBlocked(RuntimeError):
-    """Raised when the Cloudflare interstitial never hands off to the real page."""

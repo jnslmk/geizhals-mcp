@@ -64,10 +64,13 @@ container healthchecks. Give the container at least 1.5 GB of memory and
 | `MCP_HOST` | `0.0.0.0` | Bind address |
 | `MCP_PORT` | `8000` | Bind port |
 | `MCP_PATH` | `/mcp` | MCP endpoint path |
-| `GH_MAX_CONCURRENT` | `2` | Concurrent browser contexts / scrapes |
+| `GH_MAX_CONCURRENT` | `1` | Concurrent browser contexts / scrapes (hard-capped at 2) |
 | `GH_MAX_RESULTS` | `40` | Hard cap on products returned by a search |
 | `GH_MAX_BATCH_SIZE` | `10` | Cap on ids per `get_products_batch` call |
 | `GH_CHALLENGE_TIMEOUT_MS` | `25000` | How long to wait for Cloudflare to clear |
+| `GH_MAX_ATTEMPTS` | `2` | Fresh-context attempts after a challenge (hard-capped at 3) |
+| `GH_MIN_REQUEST_INTERVAL_SECONDS` | `2` | Minimum delay between browser navigations |
+| `GH_CLOUDFLARE_COOLDOWN_SECONDS` | `60` | Pause after all challenge attempts fail |
 | `GH_HEADLESS` | `0` | `1` runs headless (local dev without a display) |
 | `GH_PROXY` | *(none)* | Egress proxy URL, e.g. `http://10.0.0.5:8888` — see below |
 | `GH_PROXY_USERNAME` / `GH_PROXY_PASSWORD` | *(none)* | Optional proxy auth |
@@ -90,8 +93,8 @@ mcpSettings:
 
 `allowedAddresses` is required — LibreChat's SSRF guard blocks MCP URLs that
 resolve to private addresses, which a sibling container always does. The timeout
-is generous because a cold call starts a browser and waits out a Cloudflare
-challenge.
+is generous because a cold call starts a browser and may wait through a
+Cloudflare challenge or the configured request pacing.
 
 ### Claude Code
 
@@ -108,9 +111,16 @@ patchright install chromium
 GH_HEADLESS=1 python -m geizhals_mcp
 ```
 
-## Verifying the scraper
+The scraper intentionally stays low-volume. Each navigation passes through one
+shared request gate, with a minimum interval between starts; browser contexts
+remain capped by `GH_MAX_CONCURRENT`. A challenge gets at most
+`GH_MAX_ATTEMPTS` fresh-context attempts. If all attempts are blocked, the
+process enters a shared `GH_CLOUDFLARE_COOLDOWN_SECONDS` cooldown: later tool
+calls fail immediately with an explicit error that includes an approximate
+retry delay, rather than starting another challenge timeout. No proxy rotation,
+challenge bypass, or stale-result cache is performed.
 
-The extraction was written without live-HTML access. Before trusting a release:
+To verify a release:
 
 1. Run the server and call `search_products` with a common term (e.g. `RTX 4070`).
 2. If results come back empty but the logs show no Cloudflare block, the row
@@ -118,8 +128,9 @@ The extraction was written without live-HTML access. Before trusting a release:
    (`page.content()`), inspect it, and correct `_SEL["row"]`, `_SEL["row_price"]`
    and `_SEL["row_offercount"]`.
 3. Do the same for `get_product` against `_SEL["offer_*"]`.
-4. If calls fail with a Cloudflare-timeout error, the datacenter IP is flagged —
-   route egress through a residential/mobile proxy (see below).
+4. If a call reports a Cloudflare cooldown or challenge failure, wait for the
+   stated delay before trying again. Repeated calls during that window are
+   rejected locally and do not send more requests.
 
 ## Cloudflare and proxies
 
