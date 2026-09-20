@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 from geizhals_mcp import server
 
+
 def _product_html(pid: str) -> str:
     return f"""
 <html><body><script type="application/ld+json">

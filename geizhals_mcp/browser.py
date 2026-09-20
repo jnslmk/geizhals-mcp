@@ -259,7 +259,7 @@ class BrowserManager:
         retry_after = await self._start_cooldown()
         if isinstance(last_error, RateLimited):
             message = (
-                f"Geizhals rate-limited (429) all {MAX_ATTEMPTS} attempts; "
+                f"Geizhals rate-limited (429) after {MAX_ATTEMPTS} attempts; "
                 "requests are paused"
             )
         else:
