@@ -9,9 +9,11 @@ browser *headed* under Xvfb (headless Chromium is far easier for Cloudflare to
 flag than a headed one behind a virtual display).
 
 Unlike kleinanzeigen-mcp, there is no upstream scraper library to lean on, so
-this module owns the whole browser lifecycle itself: one shared browser, one
-fresh context per request (guarded by a semaphore), and a small helper that
-waits for the Cloudflare interstitial to clear before returning the page HTML.
+this module owns the whole browser lifecycle itself: one shared browser with
+one long-lived context per process (cookies and any Cloudflare clearance
+survive across navigations), a semaphore plus global pacing around each
+navigation, and a small helper that waits for the Cloudflare interstitial to
+clear before returning the page HTML.
 """
 
 from __future__ import annotations
@@ -19,9 +21,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 # patchright mirrors playwright's async API surface exactly, so this import is a
 # straight swap for `from playwright.async_api import ...`.
@@ -30,6 +33,8 @@ from patchright.async_api import (
     BrowserContext,
     Page,
     Playwright,
+    Response,
+    TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
 
@@ -43,6 +48,14 @@ MAX_CONCURRENT = max(1, min(int(os.getenv("GH_MAX_CONCURRENT", "1")), 2))
 MIN_REQUEST_INTERVAL_SECONDS = max(
     0.0, float(os.getenv("GH_MIN_REQUEST_INTERVAL_SECONDS", "2"))
 )
+
+# Navigations are jittered around the minimum interval so repeated requests do
+# not march in lockstep; a quarter of the interval keeps pacing predictable.
+JITTER_FRACTION = 0.25
+
+# Upper bound for the exponential backoff between retry attempts, so a large
+# MIN_REQUEST_INTERVAL_SECONDS or Retry-After cannot stall a call for minutes.
+BACKOFF_CAP_SECONDS = max(0.0, float(os.getenv("GH_BACKOFF_CAP_SECONDS", "30")))
 
 # Once all attempts hit the challenge, fail subsequent calls fast until this
 # window expires instead of repeatedly spending challenge timeouts.
@@ -60,6 +73,25 @@ CHALLENGE_TIMEOUT_MS = int(os.getenv("GH_CHALLENGE_TIMEOUT_MS", "25000"))
 # Headed-under-Xvfb by default (best against Cloudflare). Set GH_HEADLESS=1 for
 # local development on a machine without a display server.
 HEADLESS = os.getenv("GH_HEADLESS", "0") == "1"
+
+# A current stable desktop Chrome UA. The Chromium patchright launches reports
+# its real (automation-flagged) UA otherwise, and a stale or nonstandard UA is
+# an easy Cloudflare/Geizhals signal.
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+
+# Headers sent alongside the UA on every context request, matching what the
+# browser above would send for a document navigation.
+CHROME_EXTRA_HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8,"
+        "application/signed-exchange;v=b3;q=0.7"
+    ),
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.6",
+}
 
 # Optional egress proxy. Cloudflare hard-blocks datacenter IPs, so a deployment
 # on a server routes the browser through a residential IP (e.g. an HTTP proxy on
@@ -81,6 +113,38 @@ def _proxy_config() -> dict[str, str] | None:
     return proxy
 
 
+def _jittered_interval() -> float:
+    """Minimum request interval with uniform jitter, so calls do not sync up."""
+    return MIN_REQUEST_INTERVAL_SECONDS * random.uniform(
+        1.0 - JITTER_FRACTION, 1.0 + JITTER_FRACTION
+    )
+
+
+def _backoff_seconds(failed_attempt: int) -> float:
+    """Bounded exponential backoff after retry attempt `failed_attempt`."""
+    return min(
+        MIN_REQUEST_INTERVAL_SECONDS * 2 ** (failed_attempt - 1),
+        BACKOFF_CAP_SECONDS,
+    )
+
+
+async def _retry_after_seconds(response: Response) -> float:
+    """Seconds from a Retry-After header (delta-seconds or HTTP-date); 0 if absent."""
+    value = await response.header_value("retry-after")
+    if not value:
+        return 0.0
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
 # Markers that mean "still on the Cloudflare interstitial, not the real page".
 _CHALLENGE_MARKERS = (
     "just a moment",
@@ -99,12 +163,17 @@ class CloudflareBlocked(RuntimeError):
         self.retry_after = max(0.0, retry_after)
 
 
+class RateLimited(CloudflareBlocked):
+    """Raised on an HTTP 429; shares the retry/backoff/cooldown machinery."""
+
+
 class BrowserManager:
-    """Owns one Chromium instance and vends short-lived contexts."""
+    """Owns one Chromium instance and one long-lived browser context."""
 
     def __init__(self, max_concurrent: int = MAX_CONCURRENT) -> None:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._request_gate = asyncio.Lock()
         self._next_request_at = 0.0
@@ -124,6 +193,17 @@ class BrowserManager:
                 "--disable-blink-features=AutomationControlled",
             ],
         )
+        # One long-lived context: cookies — including any Cloudflare clearance
+        # and Geizhals consent choice — survive across navigations instead of
+        # being thrown away with a per-request context, which is what makes
+        # every request look new and invites repeated challenges.
+        self._context = await self._browser.new_context(
+            locale="de-DE",
+            timezone_id="Europe/Berlin",
+            viewport={"width": 1366, "height": 900},
+            user_agent=CHROME_USER_AGENT,
+            extra_http_headers=CHROME_EXTRA_HEADERS,
+        )
         log.info(
             "Chromium ready (headless=%s, max_concurrent=%s, proxy=%s)",
             HEADLESS,
@@ -132,6 +212,9 @@ class BrowserManager:
         )
 
     async def close(self) -> None:
+        if self._context is not None:
+            await self._context.close()
+            self._context = None
         if self._browser is not None:
             await self._browser.close()
             self._browser = None
@@ -143,31 +226,12 @@ class BrowserManager:
     def ready(self) -> bool:
         return self._browser is not None
 
-    @asynccontextmanager
-    async def context(self) -> AsyncIterator[BrowserContext]:
-        """A fresh, German-locale browser context, one at a time per semaphore slot."""
-        if self._browser is None:
-            raise RuntimeError("Browser manager is not running")
-        async with self._semaphore:
-            ctx = await self._browser.new_context(
-                locale="de-DE",
-                timezone_id="Europe/Berlin",
-                viewport={"width": 1366, "height": 900},
-                # Consent cookie so Geizhals skips the CMP wall and serves the
-                # listing directly. Harmless if the name drifts — the page still
-                # loads, just with the banner.
-                extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.6"},
-            )
-            try:
-                yield ctx
-            finally:
-                await ctx.close()
-
     async def fetch_html(self, url: str) -> str:
         """Load `url`, returning bounded, explicit Cloudflare failures.
 
         Navigations are globally paced even when several MCP calls arrive at
-        once. Challenge failures get at most ``MAX_ATTEMPTS`` fresh contexts;
+        once. Challenge and 429 failures get at most ``MAX_ATTEMPTS`` tries,
+        with bounded exponential backoff (honoring Retry-After) in between;
         exhausting them starts a shared cooldown so follow-up calls fail fast.
         """
         last_error: CloudflareBlocked | None = None
@@ -178,11 +242,19 @@ class BrowserManager:
             except CloudflareBlocked as exc:
                 last_error = exc
                 log.warning(
-                    "Cloudflare stalled on attempt %s/%s for %s",
+                    "%s on attempt %s/%s for %s",
+                    exc,
                     attempt,
                     MAX_ATTEMPTS,
                     url,
                 )
+                if attempt < MAX_ATTEMPTS:
+                    delay = min(
+                        max(_backoff_seconds(attempt), exc.retry_after),
+                        BACKOFF_CAP_SECONDS,
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
         retry_after = await self._start_cooldown()
         message = (
             f"Cloudflare challenge did not clear after {MAX_ATTEMPTS} "
@@ -207,7 +279,7 @@ class BrowserManager:
             if wait > 0:
                 await asyncio.sleep(wait)
                 now = time.monotonic()
-            self._next_request_at = now + MIN_REQUEST_INTERVAL_SECONDS
+            self._next_request_at = now + _jittered_interval()
 
     async def _start_cooldown(self) -> float:
         async with self._request_gate:
@@ -218,20 +290,41 @@ class BrowserManager:
             return max(0.0, self._cooldown_until - time.monotonic())
 
     async def _fetch_once(self, url: str) -> str:
-        async with self.context() as ctx:
-            page = await ctx.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            await self._await_challenge(page)
-            # The product-page JSON-LD (and the offer table) is hydrated by JS
-            # after domcontentloaded, so wait for the network to go idle before
-            # snapshotting. Best-effort: a busy page that never idles still
-            # returns whatever has rendered so far rather than erroring.
+        if self._context is None:
+            raise RuntimeError("Browser manager is not running")
+        async with self._semaphore:
+            page = await self._context.new_page()
             try:
-                await page.wait_for_load_state("networkidle", timeout=12000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(1000)
-            return await page.content()
+                response = await page.goto(
+                    url, wait_until="domcontentloaded", timeout=45000
+                )
+                if response is not None and response.status == 429:
+                    retry_after = await _retry_after_seconds(response)
+                    if retry_after:
+                        raise RateLimited(
+                            "Geizhals rate-limited the request (429); "
+                            f"retry after {retry_after:.0f}s",
+                            retry_after=retry_after,
+                        )
+                    raise RateLimited(
+                        "Geizhals rate-limited the request (429) without "
+                        "a Retry-After header"
+                    )
+                await self._await_challenge(page)
+                # The product-page JSON-LD (and the offer table) is hydrated by JS
+                # after domcontentloaded, so wait for the network to go idle before
+                # snapshotting. Best-effort: a busy page that never idles still
+                # returns whatever has rendered so far rather than erroring.
+                # Only that timeout is tolerated — anything else (navigation
+                # crashed, context closed, ...) propagates.
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=12000)
+                except PlaywrightTimeoutError:
+                    pass
+                await page.wait_for_timeout(1000)
+                return await page.content()
+            finally:
+                await page.close()
 
     async def _await_challenge(self, page: Page) -> None:
         """Block until the page is no longer the Cloudflare interstitial."""

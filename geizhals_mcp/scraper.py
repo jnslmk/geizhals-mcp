@@ -26,6 +26,11 @@ from urllib.parse import quote_plus
 
 BASE_URL = "https://geizhals.de/"
 
+
+class ParseError(RuntimeError):
+    """Raised when a page lacks the structure we parse — drift or error page."""
+
+
 # Product id from a Geizhals URL: canonical is "<slug>-a<id>.html"; the bare
 # "/a<id>.html" redirect form is matched too.
 _PRODUCT_HREF = re.compile(r"[/-]a(\d+)\.html")
@@ -33,12 +38,11 @@ _PRODUCT_HREF = re.compile(r"[/-]a(\d+)\.html")
 _PRICE = re.compile(r"(\d[\d.\s]*),(\d{2})")
 
 # The few HTML selectors still used, kept in one place. The product-page parser
-# is JSON-LD-first, so these only back the search SERP and a title fallback.
+# is JSON-LD-first, so these only back the search SERP.
 _SEL: dict[str, str] = {
     "name_link": "a.galleryview__name-link",
     "price_link": "a.galleryview__price-link",
     "offercount_link": "a.galleryview__offercount-link",
-    "product_title": "h1",
 }
 
 
@@ -80,7 +84,19 @@ def _url_id(url: str | None) -> str | None:
 # --------------------------------------------------------------------------- #
 
 # Import here so a bs4-less environment still imports the pure helpers above.
-from bs4 import BeautifulSoup, Tag  # noqa: E402
+from bs4 import BeautifulSoup  # noqa: E402
+
+# Text snippets that positively identify an empty result set, in German and
+# English. Only consulted when zero tiles matched, so a results page carrying
+# one of these strings inside unrelated copy can never trigger them.
+_NO_RESULTS_MARKERS = (
+    "keine treffer",
+    "keine ergebnisse",
+    "keine produkte gefunden",
+    "nichts gefunden",
+    "no results",
+    "no products found",
+)
 
 
 def parse_search(html: str, *, max_results: int) -> list[dict[str, Any]]:
@@ -89,6 +105,10 @@ def parse_search(html: str, *, max_results: int) -> list[dict[str, Any]]:
     Each Geizhals tile exposes its product through several anchors that share
     one ``…-a<id>.html`` href; we group them by that id so name, price and offer
     count land on one record. Order follows the page's own ranking.
+
+    Raises `ParseError` when the page shows neither product tiles nor a
+    recognizable empty-results state — selector drift or an error page must
+    not masquerade as a successful search with zero hits.
     """
     soup = BeautifulSoup(html, "lxml")
     products: dict[str, dict[str, Any]] = {}
@@ -124,8 +144,21 @@ def parse_search(html: str, *, max_results: int) -> list[dict[str, Any]]:
         elif "galleryview__offercount-link" in classes:
             rec["offer_count"] = _int_of(text)
 
-    results = [products[i] for i in order if products[i]["name"]]
-    return results[:max_results]
+    if products:
+        return [products[i] for i in order if products[i]["name"]][:max_results]
+
+    text = soup.get_text(" ", strip=True).lower()
+    if any(marker in text for marker in _NO_RESULTS_MARKERS):
+        return []
+    # The SERP always wraps its listing in #results (the page's own
+    # "skip to results" anchor points there): a shell without tiles is a
+    # positively recognized empty result set.
+    if soup.select_one("#results") is not None:
+        return []
+    raise ParseError(
+        "search page has no product tiles and no recognizable no-results "
+        "state; selectors may have drifted or an error page was served"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -138,24 +171,19 @@ def parse_product(html: str, product_id: str) -> dict[str, Any]:
 
     Reads the page's JSON-LD ``ProductGroup``, picking the ``hasVariant`` entry
     matching ``product_id`` (the page shows the whole group even when a single
-    variant was requested). Falls back to the ``<h1>`` and an empty offer list
-    if the structured data is missing.
+    variant was requested). Raises `ParseError` if the structured data is
+    missing — silently degrading to an empty offer list would present a broken
+    fetch as a product with no merchants.
     """
     soup = BeautifulSoup(html, "lxml")
     product = _find_product_ld(soup, product_id)
 
     if product is None:
-        title = soup.select_one(_SEL["product_title"])
-        return {
-            "id": product_id,
-            "name": title.get_text(" ", strip=True) if title else None,
-            "url": f"{BASE_URL}a{product_id}.html",
-            "price_min": None,
-            "price_max": None,
-            "currency": "EUR",
-            "offer_count": None,
-            "offers": [],
-        }
+        raise ParseError(
+            f"product page for {product_id} has no JSON-LD Product or "
+            "ProductGroup; selectors may have drifted or an error page "
+            "was served"
+        )
 
     agg = product.get("offers") or {}
     if isinstance(agg, list):

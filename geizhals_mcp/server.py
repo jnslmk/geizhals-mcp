@@ -19,6 +19,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
+from urllib.parse import urlparse
 
 from fastmcp import FastMCP
 from pydantic import Field
@@ -36,6 +37,33 @@ MAX_RESULTS = int(os.getenv("GH_MAX_RESULTS", "40"))
 MAX_BATCH_SIZE = int(os.getenv("GH_MAX_BATCH_SIZE", "10"))
 
 _browser: BrowserManager | None = None
+
+
+# Hostnames `search_by_url` may point the browser at: only Geizhals' own
+# (www.) domains count — the previous substring check let
+# "https://evil.example/?x=geizhals.de" through.
+_ALLOWED_GH_HOSTS = frozenset(
+    host
+    for tld in ("de", "at", "eu")
+    for host in (f"geizhals.{tld}", f"www.geizhals.{tld}")
+)
+
+
+def _validate_scrape_url(url: str) -> None:
+    """Reject any URL we do not want the real browser to navigate to."""
+    parts = urlparse(url)
+    try:
+        port = parts.port
+    except ValueError:  # malformed port (e.g. outside 0-65535)
+        port = -1
+    if (
+        parts.scheme != "https"
+        or parts.username is not None
+        or parts.password is not None
+        or port is not None
+        or (parts.hostname or "").lower() not in _ALLOWED_GH_HOSTS
+    ):
+        raise ValueError("url must be a https geizhals.de/.at/.eu URL")
 
 
 def _manager() -> BrowserManager:
@@ -225,9 +253,10 @@ async def get_products_batch(
     """Fetch full offer lists for several products in one call.
 
     The normal follow-up to `search_products`. Failed ids are reported in
-    `errors` rather than failing the whole call. The browser-level
-    `GH_MAX_CONCURRENT` gate caps concurrent tool calls; `max_concurrent` only
-    limits the detail fetches inside this call.
+    `errors` rather than failing the whole call; `success` is only true when
+    every id came back. The browser-level `GH_MAX_CONCURRENT` gate caps
+    concurrent tool calls; `max_concurrent` only limits the detail fetches
+    inside this call.
     """
     ids = [i.strip() for i in product_ids if i and i.strip().isdigit()]
     if not ids:
@@ -256,7 +285,7 @@ async def get_products_batch(
             results.append(outcome)
 
     return {
-        "success": True,
+        "success": not errors,
         "requested": len(ids),
         "returned": len(results),
         "results": results,
@@ -276,8 +305,7 @@ async def search_by_url(
     encodes constraints (attributes, price bands, availability) that the
     keyword `search_products` cannot express, and this keeps every one of them.
     """
-    if "geizhals." not in url:
-        raise ValueError("url must be a geizhals.de/.at/.eu URL")
+    _validate_scrape_url(url)
     max_results = _resolve_max_results(max_results, limit)
     html = await _fetch(url)
     results = scraper.parse_search(html, max_results=max_results)
