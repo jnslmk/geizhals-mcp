@@ -26,5 +26,8 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v4
         with:
+          # Tags pushed with GITHUB_TOKEN deliberately fire no workflow events,
+          # so build.yml would never see the release tag; a PAT push does.
+          token: ${{ secrets.RELEASE_PAT || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
