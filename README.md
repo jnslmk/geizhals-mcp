@@ -10,7 +10,8 @@ Companion to [jnslmk/kleinanzeigen-mcp](https://github.com/jnslmk/kleinanzeigen-
 
 > Geizhals search pages sit behind a Cloudflare JS challenge, so
 > `search_products` and `search_by_url` drive a real (patched, headed) browser.
-> Product detail calls use direct HTTP and parse the server-rendered offer table.
+> Product detail and price-history calls use direct HTTP; product detail parses
+> the server-rendered offer table while price history preserves the endpoint data.
 > Search parsing is anchored on the live `galleryview__*` markup. These paths
 > were verified end-to-end against live pages (July 2026).
 >
@@ -26,6 +27,7 @@ Companion to [jnslmk/kleinanzeigen-mcp](https://github.com/jnslmk/kleinanzeigen-
 | `search_products` | Search by keyword, sort by price/relevance, filter by price band. Returns product summaries. |
 | `get_product` | Full detail — name, price range, per-merchant offers — for one product id. |
 | `get_products_batch` | Full details for several ids at once — the normal follow-up to a search. |
+| `get_price_history` | Direct, cookieless price history for one product id and a fixed period/location. |
 | `search_by_url` | Search from a pasted Geizhals URL, preserving filters `search_products` cannot express. |
 
 The intended flow is `search_products` → pick interesting ids →
@@ -41,8 +43,9 @@ Geizhals search pages are fronted by Cloudflare's "Sichere Verbindung wird
   (a patched, undetected Playwright fork) drives Chromium **headed under Xvfb**
   for `search_products` and `search_by_url` — a headed browser behind a virtual
   display clears Cloudflare far more reliably than headless from a datacenter IP.
-- **Product detail:** `get_product` and `get_products_batch` fetch directly over
-  HTTP and parse the server-rendered offer table.
+- **Direct HTTP:** `get_product` and `get_products_batch` parse server-rendered
+  offer tables, while `get_price_history` POSTs directly to the cookieless
+  price-history endpoint.
 - **Parsing:** `scraper.py` reads `galleryview__*` search tiles and the stable
   `aNNNNNNN.html` product hrefs.
 
@@ -168,12 +171,13 @@ by GitHub Actions on native runners for each architecture.
 
 ## Caveats
 
-Geizhals has no public API, so search pages require a browser and product detail
-pages are fetched directly. Either path can break whenever Geizhals change their
-markup or tighten Cloudflare, and heavy or parallel use will trip bot detection
-— particularly from a datacenter IP. Scraping is also at odds with Geizhals'
-terms of service. Keep it to personal-scale use; the conservative browser
-search defaults exist for exactly this reason.
+Geizhals has no public API: search pages require a browser, while product detail
+pages and the cookieless price-history endpoint use direct HTTP. These paths can
+break whenever Geizhals change their markup, endpoint, or Cloudflare policy, and
+heavy or parallel use will trip bot detection — particularly from a datacenter
+IP. Scraping is also at odds with Geizhals' terms of service. Keep it to
+personal-scale use; the conservative browser search defaults exist for exactly
+this reason.
 
 ## License
 

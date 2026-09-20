@@ -105,6 +105,82 @@ class GetProductsBatchTests(unittest.IsolatedAsyncioTestCase):
 
 
 
+
+
+class GetPriceHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wraps_untouched_upstream_history_without_browser(self) -> None:
+        upstream_response = [[1720000000, 99.95]]
+        upstream_meta = {"currency": "EUR"}
+        fetch = AsyncMock(return_value=(upstream_response, upstream_meta))
+        with (
+            patch.object(server, "_fetch_price_history", fetch),
+            patch.object(
+                server, "_search_manager", side_effect=AssertionError("browser must not be used")
+            ),
+        ):
+            result = await server.get_price_history(" 42 ", days="91", loc="at")
+
+        fetch.assert_awaited_once_with(42, 91, "at")
+        self.assertEqual(
+            result,
+            {
+                "product_id": 42,
+                "days": 91,
+                "loc": "at",
+                "response": upstream_response,
+                "meta": upstream_meta,
+            },
+        )
+        self.assertIs(result["response"], upstream_response)
+        self.assertIs(result["meta"], upstream_meta)
+
+    async def test_rejects_invalid_inputs_before_request(self) -> None:
+        fetch = AsyncMock()
+        invalid_calls = (
+            {"product_id": "not-an-id"},
+            {"product_id": 42, "days": 8},
+            {"product_id": 42, "days": "seven"},
+            {"product_id": 42, "loc": "eu"},
+        )
+        with patch.object(server, "_fetch_price_history", fetch):
+            for kwargs in invalid_calls:
+                with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                    await server.get_price_history(**kwargs)
+        fetch.assert_not_awaited()
+
+
+class FetchPriceHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_posts_exact_single_id_payload(self) -> None:
+        response = Mock()
+        response.json.return_value = {"response": [[1720000000, 99.95]], "meta": {"foo": "bar"}}
+        client = AsyncMock()
+        client.post.return_value = response
+        client.__aenter__.return_value = client
+
+        with patch.object(server.httpx, "AsyncClient", return_value=client) as factory:
+            result = await server._fetch_price_history(42, 31, "de")
+
+        self.assertEqual(result, ([[1720000000, 99.95]], {"foo": "bar"}))
+        factory.assert_called_once_with(follow_redirects=True)
+        client.post.assert_awaited_once_with(
+            "https://geizhals.de/api/gh0/price_history",
+            json={"id": [42], "params": {"days": 31, "loc": "de"}},
+        )
+        response.raise_for_status.assert_called_once_with()
+
+    async def test_rejects_malformed_upstream_body(self) -> None:
+        response = Mock()
+        response.json.return_value = {"response": []}
+        client = AsyncMock()
+        client.post.return_value = response
+        client.__aenter__.return_value = client
+
+        with (
+            patch.object(server.httpx, "AsyncClient", return_value=client),
+            self.assertRaisesRegex(RuntimeError, "must contain response and meta"),
+        ):
+            await server._fetch_price_history(42, 31, "de")
+
 class FetchProductTests(unittest.IsolatedAsyncioTestCase):
     async def test_follows_redirects_with_plain_httpx(self) -> None:
         response = Mock(text="<html>product</html>")

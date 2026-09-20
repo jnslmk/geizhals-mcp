@@ -242,6 +242,40 @@ async def get_product(
 
 
 @mcp.tool
+async def get_price_history(
+    product_id: Annotated[
+        str | int,
+        Field(description="Geizhals numeric product id, e.g. 2830710 (the N in aN.html)"),
+    ],
+    days: Annotated[
+        str | int,
+        Field(description="History period: one of 7, 31, 91, 183, 365, or 9999 days"),
+    ] = 31,
+    loc: Annotated[str, Field(description="Geizhals market: 'de' (default) or 'at'")] = "de",
+) -> dict[str, Any]:
+    """Fetch the upstream price history for one product without browser state."""
+    if isinstance(product_id, bool) or isinstance(days, bool):
+        raise ValueError("product_id and days must be integers")
+    product_id = _coerce_int(product_id, "product_id", ge=1)
+    if product_id is None:
+        raise ValueError("product_id must be the numeric id from an aN.html URL")
+    days = _coerce_int(days, "days")
+    if days not in {7, 31, 91, 183, 365, 9999}:
+        raise ValueError("days must be one of 7, 31, 91, 183, 365, or 9999")
+    if loc not in {"de", "at"}:
+        raise ValueError("loc must be 'de' or 'at'")
+
+    response, meta = await _fetch_price_history(product_id, days, loc)
+    return {
+        "product_id": product_id,
+        "days": days,
+        "loc": loc,
+        "response": response,
+        "meta": meta,
+    }
+
+
+@mcp.tool
 async def get_products_batch(
     product_ids: Annotated[
         list[str],
@@ -326,6 +360,23 @@ async def _fetch_product(url: str) -> str:
         response = await client.get(url)
         response.raise_for_status()
         return response.text
+
+
+async def _fetch_price_history(product_id: int, days: int, loc: str) -> tuple[Any, Any]:
+    """Fetch one upstream price-history response using direct HTTP only."""
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        response = await client.post(
+            "https://geizhals.de/api/gh0/price_history",
+            json={"id": [product_id], "params": {"days": days, "loc": loc}},
+        )
+        response.raise_for_status()
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise RuntimeError("price history response was not valid JSON") from exc
+    if not isinstance(body, dict) or "response" not in body or "meta" not in body:
+        raise RuntimeError("price history response must contain response and meta")
+    return body["response"], body["meta"]
 
 
 @mcp.custom_route("/healthz", methods=["GET"])
