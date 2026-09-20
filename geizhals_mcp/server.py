@@ -6,9 +6,9 @@ fetches the full per-merchant offer list for the ids worth a closer look. This
 keeps a broad search from flooding the model's context with offer tables it did
 not ask for.
 
-The scraping itself (headless Chromium past Cloudflare + HTML parsing) lives in
-`browser.py` and `scraper.py`; this module owns the browser lifecycle and the
-tool surface only.
+The browser-backed search scraping lives in `browser.py`; direct product-page
+fetching and HTML parsing live in `scraper.py`. This module owns the browser
+lifecycle and tool surface only.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any
 from urllib.parse import urlparse
 
+import httpx
 from fastmcp import FastMCP
 from pydantic import Field
 from starlette.requests import Request
@@ -227,16 +228,16 @@ async def get_product(
         Field(description="Geizhals numeric product id, e.g. '2830710' (the N in aN.html)"),
     ],
 ) -> dict[str, Any]:
-    """Fetch one product's full detail: name, price range and per-merchant offers.
+    """Fetch one product's full detail: name, price range and merchant offers.
 
-    For more than one product prefer `get_products_batch`, which reuses the
-    browser and reports failures per id instead of failing the whole call.
+    For more than one product prefer `get_products_batch`, which reports
+    failures per id instead of failing the whole call.
     """
     product_id = product_id.strip()
     if not product_id.isdigit():
         raise ValueError("product_id must be the numeric id from an aN.html URL")
 
-    html = await _fetch(f"https://geizhals.de/a{product_id}.html")
+    html = await _fetch_product(f"https://geizhals.de/a{product_id}.html")
     return scraper.parse_product(html, product_id)
 
 
@@ -254,9 +255,8 @@ async def get_products_batch(
 
     The normal follow-up to `search_products`. Failed ids are reported in
     `errors` rather than failing the whole call; `success` is only true when
-    every id came back. The browser-level `GH_MAX_CONCURRENT` gate caps
-    concurrent tool calls; `max_concurrent` only limits the detail fetches
-    inside this call.
+    every id came back. `max_concurrent` limits direct detail fetches inside
+    this call.
     """
     ids = [i.strip() for i in product_ids if i and i.strip().isdigit()]
     if not ids:
@@ -271,7 +271,7 @@ async def get_products_batch(
 
     async def fetch(pid: str) -> dict[str, Any]:
         async with semaphore:
-            html = await _fetch(f"https://geizhals.de/a{pid}.html")
+            html = await _fetch_product(f"https://geizhals.de/a{pid}.html")
             return scraper.parse_product(html, pid)
 
     outcomes = await asyncio.gather(*(fetch(i) for i in ids), return_exceptions=True)
@@ -318,6 +318,14 @@ async def _fetch(url: str) -> str:
         return await _manager().fetch_html(url)
     except CloudflareBlocked as exc:
         raise RuntimeError(str(exc)) from exc
+
+
+async def _fetch_product(url: str) -> str:
+    """Fetch one product page without browser state or challenge handling."""
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.text
 
 
 @mcp.custom_route("/healthz", methods=["GET"])

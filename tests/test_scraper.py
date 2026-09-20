@@ -10,24 +10,23 @@ _TILE_HTML = """
 </div></body></html>
 """
 
-_PRODUCT_LD_HTML = """
-<html><body>
-<script type="application/ld+json">
-{"@context": "https://schema.org", "@type": "ProductGroup",
- "hasVariant": [{
-   "@type": "Product", "name": "Foo 8GB",
-   "url": "https://geizhals.de/foo8-a123456.html",
-   "offers": {"@type": "AggregateOffer", "lowPrice": "99.00",
-              "highPrice": "149.50", "priceCurrency": "EUR", "offerCount": 3,
-              "offers": [
-                {"@type": "Offer", "price": "120.00", "priceCurrency": "EUR",
-                 "url": "https://merchant2.example/y",
-                 "seller": {"@type": "Organization", "name": "Merchant 2"}},
-                {"@type": "Offer", "price": "99.00", "priceCurrency": "EUR",
-                 "url": "https://merchant1.example/x",
-                 "seller": {"@type": "Organization", "name": "Merchant 1"},
-                 "availability": "https://schema.org/InStock"}]}}]}
-</script>
+_PRODUCT_TABLE_HTML = """
+<html><head>
+  <link rel="canonical" href="https://geizhals.de/foo8-a123456.html">
+</head><body>
+  <h1>Foo 8GB</h1>
+  <table id="offerlist">
+    <tr>
+      <td class="offerlist__shop"><a href="https://merchant2.example/y">Merchant 2</a></td>
+      <td class="offerlist__price">&euro; 120,00</td>
+      <td class="offerlist__delivery">2–4 Tage</td>
+    </tr>
+    <tr>
+      <td class="offerlist__shop"><a href="https://merchant1.example/x">Merchant 1</a></td>
+      <td class="offerlist__price">&euro; 99,00</td>
+      <td class="offerlist__delivery">lagernd</td>
+    </tr>
+  </table>
 </body></html>
 """
 
@@ -74,52 +73,24 @@ class ParseSearchTests(unittest.TestCase):
 
 
 class ParseProductTests(unittest.TestCase):
-    def test_json_ld_product_group_is_parsed_with_sorted_offers(self) -> None:
-        product = scraper.parse_product(_PRODUCT_LD_HTML, "123456")
+    def test_offer_table_is_parsed_with_sorted_offers(self) -> None:
+        product = scraper.parse_product(_PRODUCT_TABLE_HTML, "123456")
         self.assertEqual(product["name"], "Foo 8GB")
+        self.assertEqual(product["url"], "https://geizhals.de/foo8-a123456.html")
         self.assertEqual(product["price_min"], 99.0)
-        self.assertEqual(product["price_max"], 149.5)
+        self.assertEqual(product["price_max"], 120.0)
         self.assertEqual(product["currency"], "EUR")
-        self.assertEqual([o["merchant"] for o in product["offers"]],
-                         ["Merchant 1", "Merchant 2"])
-        self.assertEqual(product["offers"][0]["availability"], "InStock")
+        self.assertEqual(product["offer_count"], 2)
+        self.assertEqual(
+            [offer["merchant"] for offer in product["offers"]],
+            ["Merchant 1", "Merchant 2"],
+        )
+        self.assertEqual(product["offers"][0]["availability"], "lagernd")
 
-    def test_missing_json_ld_raises_instead_of_zero_offers(self) -> None:
+    def test_unrecognized_product_markup_raises(self) -> None:
         html = "<html><body><h1>Foo Bar</h1><p>Keine Angebote.</p></body></html>"
         with self.assertRaisesRegex(scraper.ParseError, "123456"):
             scraper.parse_product(html, "123456")
-
-    def test_malformed_json_ld_raises_instead_of_zero_offers(self) -> None:
-        html = ('<html><body><script type="application/ld+json">{broken'
-                "</script></body></html>")
-        with self.assertRaises(scraper.ParseError):
-            scraper.parse_product(html, "123456")
-
-    def test_json_ld_products_for_other_ids_raise(self) -> None:
-        # Products on the page, but none matching the requested pid: returning
-        # one anyway would present the wrong product as the requested one.
-        html = """
-        <html><body>
-        <script type="application/ld+json">
-        [{"@type": "Product", "name": "Other 1", "url": "https://geizhals.de/other-a111.html"},
-         {"@type": "Product", "name": "Other 2", "url": "https://geizhals.de/other-a222.html"}]
-        </script></body></html>
-        """
-        with self.assertRaisesRegex(scraper.ParseError, "123456"):
-            scraper.parse_product(html, "123456")
-
-    def test_json_ld_product_without_correlatable_url_is_accepted(self) -> None:
-        html = """
-        <html><body>
-        <script type="application/ld+json">
-        {"@type": "Product", "name": "Foo",
-         "offers": {"@type": "AggregateOffer", "lowPrice": "5.00",
-                    "priceCurrency": "EUR", "offerCount": 1}}
-        </script></body></html>
-        """
-        product = scraper.parse_product(html, "123456")
-        self.assertEqual(product["name"], "Foo")
-        self.assertEqual(product["id"], "123456")
 
 
 if __name__ == "__main__":
