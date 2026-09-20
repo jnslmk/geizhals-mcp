@@ -64,12 +64,14 @@ container healthchecks. Give the container at least 1.5 GB of memory and
 | `MCP_HOST` | `0.0.0.0` | Bind address |
 | `MCP_PORT` | `8000` | Bind port |
 | `MCP_PATH` | `/mcp` | MCP endpoint path |
-| `GH_MAX_CONCURRENT` | `1` | Concurrent browser contexts / scrapes (hard-capped at 2) |
+| `GH_MAX_CONCURRENT` | `1` | Concurrent scrapes on the shared browser context (hard-capped at 2) |
 | `GH_MAX_RESULTS` | `40` | Hard cap on products returned by a search |
 | `GH_MAX_BATCH_SIZE` | `10` | Cap on ids per `get_products_batch` call |
 | `GH_CHALLENGE_TIMEOUT_MS` | `25000` | How long to wait for Cloudflare to clear |
-| `GH_MAX_ATTEMPTS` | `2` | Fresh-context attempts after a challenge (hard-capped at 3) |
+| `GH_MAX_ATTEMPTS` | `2` | Attempts after a challenge or 429 rate limit (hard-capped at 3) |
 | `GH_MIN_REQUEST_INTERVAL_SECONDS` | `2` | Minimum delay between browser navigations |
+| `GH_BACKOFF_CAP_SECONDS` | `30` | Upper bound for the exponential backoff between retry attempts |
+| `GH_USER_AGENT` | recent Chrome UA | Browser user agent sent on every request; override when the built-in default ages |
 | `GH_CLOUDFLARE_COOLDOWN_SECONDS` | `60` | Pause after all challenge attempts fail |
 | `GH_HEADLESS` | `0` | `1` runs headless (local dev without a display) |
 | `GH_PROXY` | *(none)* | Egress proxy URL, e.g. `http://10.0.0.5:8888` — see below |
@@ -112,13 +114,15 @@ GH_HEADLESS=1 python -m geizhals_mcp
 ```
 
 The scraper intentionally stays low-volume. Each navigation passes through one
-shared request gate, with a minimum interval between starts; browser contexts
-remain capped by `GH_MAX_CONCURRENT`. A challenge gets at most
-`GH_MAX_ATTEMPTS` fresh-context attempts. If all attempts are blocked, the
-process enters a shared `GH_CLOUDFLARE_COOLDOWN_SECONDS` cooldown: later tool
-calls fail immediately with an explicit error that includes an approximate
-retry delay, rather than starting another challenge timeout. No proxy rotation,
-challenge bypass, or stale-result cache is performed.
+shared request gate, with a jittered minimum interval between starts; pages on
+the shared browser context remain capped by `GH_MAX_CONCURRENT`. A challenge or
+429 rate limit gets at most `GH_MAX_ATTEMPTS` attempts, with bounded
+exponential backoff (`GH_BACKOFF_CAP_SECONDS`, honoring the server's
+`Retry-After`) in between. If all attempts are blocked, the process enters a
+shared `GH_CLOUDFLARE_COOLDOWN_SECONDS` cooldown: later tool calls fail
+immediately with an explicit error that includes an approximate retry delay,
+rather than starting another challenge timeout. No proxy rotation, challenge
+bypass, or stale-result cache is performed.
 
 To verify a release:
 

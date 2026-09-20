@@ -69,6 +69,21 @@ class BrowserHardeningTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(time.monotonic() - started, 0.05)
             self.assertEqual(manager._fetch_once.await_count, 3)
 
+    async def test_rate_limit_exhaustion_does_not_blame_cloudflare(self) -> None:
+        manager = browser.BrowserManager(max_concurrent=1)
+        manager._fetch_once = AsyncMock(side_effect=browser.RateLimited("429"))
+
+        with (
+            patch.object(browser, "MAX_ATTEMPTS", 2),
+            patch.object(browser, "MIN_REQUEST_INTERVAL_SECONDS", 0),
+            patch.object(browser, "CLOUDFLARE_COOLDOWN_SECONDS", 0),
+        ):
+            with self.assertRaisesRegex(
+                browser.CloudflareBlocked, "rate-limited \\(429\\)"
+            ):
+                await manager.fetch_html("https://geizhals.de/search")
+        self.assertEqual(manager._fetch_once.await_count, 2)
+
     async def test_rate_limit_retry_honors_retry_after(self) -> None:
         manager = browser.BrowserManager(max_concurrent=1)
         manager._fetch_once = AsyncMock(

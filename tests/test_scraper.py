@@ -60,6 +60,18 @@ class ParseSearchTests(unittest.TestCase):
         with self.assertRaisesRegex(scraper.ParseError, "drifted"):
             scraper.parse_search("<html><body>Just a moment...</body></html>", max_results=10)
 
+    def test_tiles_without_name_links_raise_instead_of_returning_empty(self) -> None:
+        # Tile anchors matched, but none carries a name link: a drifted tile
+        # shape must not masquerade as a successful search with zero hits.
+        html = """
+        <html><body><div id="results">
+          <a class="galleryview__price-link" href="https://geizhals.de/foo-a123456.html">&euro; 123,45</a>
+          <a class="galleryview__offercount-link" href="https://geizhals.de/foo-a123456.html">12 Angebote</a>
+        </div></body></html>
+        """
+        with self.assertRaisesRegex(scraper.ParseError, "no name links"):
+            scraper.parse_search(html, max_results=10)
+
 
 class ParseProductTests(unittest.TestCase):
     def test_json_ld_product_group_is_parsed_with_sorted_offers(self) -> None:
@@ -82,6 +94,32 @@ class ParseProductTests(unittest.TestCase):
                 "</script></body></html>")
         with self.assertRaises(scraper.ParseError):
             scraper.parse_product(html, "123456")
+
+    def test_json_ld_products_for_other_ids_raise(self) -> None:
+        # Products on the page, but none matching the requested pid: returning
+        # one anyway would present the wrong product as the requested one.
+        html = """
+        <html><body>
+        <script type="application/ld+json">
+        [{"@type": "Product", "name": "Other 1", "url": "https://geizhals.de/other-a111.html"},
+         {"@type": "Product", "name": "Other 2", "url": "https://geizhals.de/other-a222.html"}]
+        </script></body></html>
+        """
+        with self.assertRaisesRegex(scraper.ParseError, "123456"):
+            scraper.parse_product(html, "123456")
+
+    def test_json_ld_product_without_correlatable_url_is_accepted(self) -> None:
+        html = """
+        <html><body>
+        <script type="application/ld+json">
+        {"@type": "Product", "name": "Foo",
+         "offers": {"@type": "AggregateOffer", "lowPrice": "5.00",
+                    "priceCurrency": "EUR", "offerCount": 1}}
+        </script></body></html>
+        """
+        product = scraper.parse_product(html, "123456")
+        self.assertEqual(product["name"], "Foo")
+        self.assertEqual(product["id"], "123456")
 
 
 if __name__ == "__main__":

@@ -145,7 +145,13 @@ def parse_search(html: str, *, max_results: int) -> list[dict[str, Any]]:
             rec["offer_count"] = _int_of(text)
 
     if products:
-        return [products[i] for i in order if products[i]["name"]][:max_results]
+        hits = [products[i] for i in order if products[i]["name"]]
+        if not hits:
+            raise ParseError(
+                "search page has product tile anchors but no name links; "
+                "selectors may have drifted or an error page was served"
+            )
+        return hits[:max_results]
 
     text = soup.get_text(" ", strip=True).lower()
     if any(marker in text for marker in _NO_RESULTS_MARKERS):
@@ -213,10 +219,6 @@ def _find_product_ld(soup: "BeautifulSoup", pid: str) -> dict[str, Any] | None:
             for variant in block.get("hasVariant") or []:
                 if _url_id(variant.get("url")) == pid:
                     return variant
-    # Last resort: any Product-shaped block on the page.
-    for block in blocks:
-        if block.get("@type") == "Product":
-            return block
     return None
 
 

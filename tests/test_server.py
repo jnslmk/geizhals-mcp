@@ -3,13 +3,14 @@ from unittest.mock import AsyncMock, patch
 
 from geizhals_mcp import server
 
-_PRODUCT_HTML = """
+def _product_html(pid: str) -> str:
+    return f"""
 <html><body><script type="application/ld+json">
-{"@context": "https://schema.org", "@type": "Product", "name": "Foo",
- "url": "https://geizhals.de/foo-a42.html",
- "offers": {"@type": "AggregateOffer", "lowPrice": "5.00", "offerCount": 1,
-            "offers": [{"@type": "Offer", "price": "5.00",
-                        "seller": {"@type": "Organization", "name": "M"}}]}}
+{{"@context": "https://schema.org", "@type": "Product", "name": "Foo",
+ "url": "https://geizhals.de/foo-a{pid}.html",
+ "offers": {{"@type": "AggregateOffer", "lowPrice": "5.00", "offerCount": 1,
+            "offers": [{{"@type": "Offer", "price": "5.00",
+                        "seller": {{"@type": "Organization", "name": "M"}}}}]}}}}
 </script></body></html>
 """
 
@@ -60,7 +61,7 @@ class GetProductsBatchTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             server,
             "_fetch",
-            AsyncMock(side_effect=[RuntimeError("boom"), _PRODUCT_HTML]),
+            AsyncMock(side_effect=[RuntimeError("boom"), _product_html("43")]),
         ):
             result = await server.get_products_batch(product_ids=["42", "43"])
         self.assertFalse(result["success"])
@@ -69,7 +70,11 @@ class GetProductsBatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["id"] for e in result["errors"]], ["42"])
 
     async def test_full_success_still_reports_success_true(self) -> None:
-        with patch.object(server, "_fetch", AsyncMock(return_value=_PRODUCT_HTML)):
+        with patch.object(
+            server,
+            "_fetch",
+            AsyncMock(side_effect=[_product_html("42"), _product_html("43")]),
+        ):
             result = await server.get_products_batch(product_ids=["42", "43"])
         self.assertTrue(result["success"])
         self.assertEqual(result["returned"], 2)

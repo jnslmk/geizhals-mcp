@@ -76,8 +76,9 @@ HEADLESS = os.getenv("GH_HEADLESS", "0") == "1"
 
 # A current stable desktop Chrome UA. The Chromium patchright launches reports
 # its real (automation-flagged) UA otherwise, and a stale or nonstandard UA is
-# an easy Cloudflare/Geizhals signal.
-CHROME_USER_AGENT = (
+# an easy Cloudflare/Geizhals signal. GH_USER_AGENT overrides the default when
+# it ages out.
+CHROME_USER_AGENT = os.getenv("GH_USER_AGENT") or (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 )
@@ -256,10 +257,16 @@ class BrowserManager:
                     if delay > 0:
                         await asyncio.sleep(delay)
         retry_after = await self._start_cooldown()
-        message = (
-            f"Cloudflare challenge did not clear after {MAX_ATTEMPTS} "
-            "attempts; requests are paused"
-        )
+        if isinstance(last_error, RateLimited):
+            message = (
+                f"Geizhals rate-limited (429) all {MAX_ATTEMPTS} attempts; "
+                "requests are paused"
+            )
+        else:
+            message = (
+                f"Cloudflare challenge did not clear after {MAX_ATTEMPTS} "
+                "attempts; requests are paused"
+            )
         if retry_after:
             message += f" — retry in about {retry_after:.0f}s"
         raise CloudflareBlocked(message, retry_after=retry_after) from last_error
