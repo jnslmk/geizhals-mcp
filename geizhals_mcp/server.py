@@ -40,8 +40,8 @@ MAX_BATCH_SIZE = int(os.getenv("GH_MAX_BATCH_SIZE", "10"))
 _browser: BrowserManager | None = None
 
 
-# Hostnames `search_by_url` may point the browser at: only Geizhals' own
-# (www.) domains count — the previous substring check let
+# Hostnames `search_by_url` may point the search browser at: only Geizhals'
+# own (www.) domains count — the previous substring check let
 # "https://evil.example/?x=geizhals.de" through.
 _ALLOWED_GH_HOSTS = frozenset(
     host
@@ -51,7 +51,7 @@ _ALLOWED_GH_HOSTS = frozenset(
 
 
 def _validate_scrape_url(url: str) -> None:
-    """Reject any URL we do not want the real browser to navigate to."""
+    """Reject URLs outside the search browser's Geizhals allowlist."""
     parts = urlparse(url)
     try:
         port = parts.port
@@ -67,7 +67,7 @@ def _validate_scrape_url(url: str) -> None:
         raise ValueError("url must be a https geizhals.de/.at/.eu URL")
 
 
-def _manager() -> BrowserManager:
+def _search_manager() -> BrowserManager:
     if _browser is None:  # pragma: no cover - guarded by the lifespan
         raise RuntimeError("Browser manager is not running")
     return _browser
@@ -150,7 +150,7 @@ _LimitAlias = Annotated[
 
 @asynccontextmanager
 async def lifespan(_: FastMCP) -> AsyncIterator[None]:
-    """Start one shared browser for the process lifetime."""
+    """Start the shared browser used by search tools."""
     global _browser
     _browser = BrowserManager()
     await _browser.start()
@@ -210,7 +210,7 @@ async def search_products(
     max_price = _coerce_int(max_price, "max_price", ge=0)
     max_results = _resolve_max_results(max_results, limit)
 
-    html = await _fetch(url)
+    html = await _fetch_search(url)
 
     results = scraper.parse_search(html, max_results=max_results)
     if min_price is not None:
@@ -307,15 +307,15 @@ async def search_by_url(
     """
     _validate_scrape_url(url)
     max_results = _resolve_max_results(max_results, limit)
-    html = await _fetch(url)
+    html = await _fetch_search(url)
     results = scraper.parse_search(html, max_results=max_results)
     return {"url": url, "returned": len(results), "results": results}
 
 
-async def _fetch(url: str) -> str:
-    """Fetch rendered HTML, mapping a Cloudflare block onto a clean tool error."""
+async def _fetch_search(url: str) -> str:
+    """Fetch rendered search HTML, mapping browser blocks to tool errors."""
     try:
-        return await _manager().fetch_html(url)
+        return await _search_manager().fetch_search_html(url)
     except CloudflareBlocked as exc:
         raise RuntimeError(str(exc)) from exc
 
@@ -330,7 +330,7 @@ async def _fetch_product(url: str) -> str:
 
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(_: Request) -> JSONResponse:
-    """Container healthcheck: reports whether the browser actually came up."""
+    """Container healthcheck: reports whether the search browser came up."""
     if _browser is None or not _browser.ready:
         return JSONResponse({"status": "starting"}, status_code=503)
     return JSONResponse({"status": "ok"})

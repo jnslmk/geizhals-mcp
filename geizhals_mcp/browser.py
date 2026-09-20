@@ -1,19 +1,18 @@
-"""Headless-browser lifecycle for scraping Geizhals.
+"""Browser lifecycle for browser-gated Geizhals search pages.
 
-Geizhals sits behind a Cloudflare JS challenge ("Sichere Verbindung wird
-überprüft"), so a plain HTTP client gets a 403 and this has to drive a real
-browser that can execute the challenge script. Vanilla Playwright is trivially
-fingerprinted by Cloudflare, so we use **patchright** — a drop-in patched
-Playwright fork built to defeat that detection — and, in the container, run the
-browser *headed* under Xvfb (headless Chromium is far easier for Cloudflare to
-flag than a headed one behind a virtual display).
+Geizhals search pages sit behind a Cloudflare JS challenge ("Sichere Verbindung
+wird überprüft"), so a plain HTTP client gets a 403 and this has to drive a
+real browser that can execute the challenge script. Vanilla Playwright is
+trivially fingerprinted by Cloudflare, so we use **patchright** — a drop-in
+patched Playwright fork built to defeat that detection — and, in the container,
+run the browser *headed* under Xvfb (headless Chromium is far easier for
+Cloudflare to flag than a headed one behind a virtual display).
 
-Unlike kleinanzeigen-mcp, there is no upstream scraper library to lean on, so
-this module owns the whole browser lifecycle itself: one shared browser with
-one long-lived context per process (cookies and any Cloudflare clearance
-survive across navigations), a semaphore plus global pacing around each
-navigation, and a small helper that waits for the Cloudflare interstitial to
-clear before returning the page HTML.
+This module owns browser state for search surfaces only: one shared browser
+with one long-lived context per process (cookies and any Cloudflare clearance
+survive across navigations), a semaphore plus global pacing around each search
+navigation, and a helper that waits for the Cloudflare interstitial before
+returning search HTML.
 """
 
 from __future__ import annotations
@@ -34,17 +33,17 @@ from patchright.async_api import (
     Page,
     Playwright,
     Response,
-    TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
 
 log = logging.getLogger("geizhals-mcp.browser")
 
-# Keep direct scraping deliberately gentle. The upper bound prevents an
-# environment mistake from turning one MCP call into a request burst.
+# Keep browser-gated search scraping deliberately gentle. The upper bound
+# prevents an environment mistake from turning one MCP search call into a
+# request burst.
 MAX_CONCURRENT = max(1, min(int(os.getenv("GH_MAX_CONCURRENT", "1")), 2))
 
-# Minimum delay between browser navigations, shared by all tool calls.
+# Minimum delay between browser search navigations, shared by search tools.
 MIN_REQUEST_INTERVAL_SECONDS = max(
     0.0, float(os.getenv("GH_MIN_REQUEST_INTERVAL_SECONDS", "2"))
 )
@@ -169,7 +168,7 @@ class RateLimited(CloudflareBlocked):
 
 
 class BrowserManager:
-    """Owns one Chromium instance and one long-lived browser context."""
+    """Owns browser state for browser-gated search surfaces."""
 
     def __init__(self, max_concurrent: int = MAX_CONCURRENT) -> None:
         self._playwright: Playwright | None = None
@@ -227,11 +226,11 @@ class BrowserManager:
     def ready(self) -> bool:
         return self._browser is not None
 
-    async def fetch_html(self, url: str) -> str:
-        """Load `url`, returning bounded, explicit Cloudflare failures.
+    async def fetch_search_html(self, url: str) -> str:
+        """Load a search URL, returning bounded, explicit Cloudflare failures.
 
-        Navigations are globally paced even when several MCP calls arrive at
-        once. Challenge and 429 failures get at most ``MAX_ATTEMPTS`` tries,
+        Search navigations are globally paced even when several MCP calls arrive
+        at once. Challenge and 429 failures get at most ``MAX_ATTEMPTS`` tries,
         with bounded exponential backoff (honoring Retry-After) in between;
         exhausting them starts a shared cooldown so follow-up calls fail fast.
         """
@@ -318,17 +317,6 @@ class BrowserManager:
                         "a Retry-After header"
                     )
                 await self._await_challenge(page)
-                # The product-page JSON-LD (and the offer table) is hydrated by JS
-                # after domcontentloaded, so wait for the network to go idle before
-                # snapshotting. Best-effort: a busy page that never idles still
-                # returns whatever has rendered so far rather than erroring.
-                # Only that timeout is tolerated — anything else (navigation
-                # crashed, context closed, ...) propagates.
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=12000)
-                except PlaywrightTimeoutError:
-                    pass
-                await page.wait_for_timeout(1000)
                 return await page.content()
             finally:
                 await page.close()

@@ -46,6 +46,20 @@ class ValidateScrapeUrlTests(unittest.TestCase):
                     server._validate_scrape_url(url)
 
 
+class SearchProductsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_one_browser_search_fetch(self) -> None:
+        url = server.scraper.search_url("RTX 4070", sort="r")
+        fetch = AsyncMock(return_value="<html />")
+        with (
+            patch.object(server, "_fetch_search", fetch),
+            patch.object(server.scraper, "parse_search", return_value=[]),
+        ):
+            result = await server.search_products("RTX 4070")
+
+        fetch.assert_awaited_once_with(url)
+        self.assertEqual(result, {"query": "RTX 4070", "returned": 0, "results": []})
+
+
 class GetProductTests(unittest.IsolatedAsyncioTestCase):
     async def test_uses_direct_product_transport(self) -> None:
         fetch = AsyncMock(return_value=_product_html("42"))
